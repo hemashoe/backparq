@@ -72,9 +72,17 @@ class ParquetConfig:
 
 
 @dataclass(frozen=True)
+class RetentionConfig:
+    enabled: bool = False
+    days: int = 0
+    months: int = 0
+
+
+@dataclass(frozen=True)
 class ArchiveConfig:
     tables: list[str]
-    cutoff_exclusive: dt.datetime
+    mode: str # "backup" or "offload"
+    cutoff_exclusive: Optional[dt.datetime]
     base_dir: Path
     fetch_size: int = 10_000
     overwrite: bool = False
@@ -82,6 +90,61 @@ class ArchiveConfig:
     perform_delete: bool = False
     delete_batch_size: int = 10_000
     order_by: str = DEFAULT_ORDER_BY
+    concurrency: int = 1
+    chunk_concurrency: int = 1
+    retention: RetentionConfig = dataclasses.field(default_factory=RetentionConfig)
+
+    def __post_init__(self):
+        if self.mode not in ("backup", "offload"):
+            raise ConfigError(f"Invalid mode '{self.mode}'. Must be 'backup' or 'offload'.")
+        if self.mode == "backup" and self.perform_delete:
+            raise ConfigError("Creation of 'backup' snapshots (backup mode) cannot be combined with 'perform_delete'. This is strictly for keeping full snapshots.")
+
+
+def _parse_retention(data: dict[str, Any]) -> RetentionConfig:
+    if not data:
+        return RetentionConfig()
+    
+    return RetentionConfig(
+        enabled=_optional_bool(data, "enabled", False),
+        days=_optional_int(data, "days", 0),
+        months=_optional_int(data, "months", 0),
+    )
+
+
+def _parse_archive(data: dict[str, Any]) -> ArchiveConfig:
+    tables = data.get("tables")
+    if not isinstance(tables, list) or not tables:
+        raise ConfigError("'archive.tables' must be a non-empty list.")
+    cleaned_tables = []
+    for table in tables:
+        if not isinstance(table, str) or not table.strip():
+            raise ConfigError("'archive.tables' must contain only strings.")
+        cleaned_tables.append(table.strip())
+
+    mode = _optional_str(data, "mode", "offload").lower()
+
+    cutoff_raw = _optional_str(data, "cutoff_exclusive", "")
+    cutoff = parse_utc_datetime(cutoff_raw) if cutoff_raw else None
+    
+    base_dir = Path(_optional_str(data, "base_dir", str(REQUIRED_BASE_DIR))).resolve()
+    ensure_under_base_dir(base_dir)
+
+    return ArchiveConfig(
+        tables=cleaned_tables,
+        mode=mode,
+        cutoff_exclusive=cutoff,
+        base_dir=base_dir,
+        fetch_size=_optional_int(data, "fetch_size", 10_000),
+        overwrite=_optional_bool(data, "overwrite", False),
+        dry_run=_optional_bool(data, "dry_run", False),
+        perform_delete=_optional_bool(data, "perform_delete", False),
+        delete_batch_size=_optional_int(data, "delete_batch_size", 10_000),
+        order_by=_optional_str(data, "order_by", DEFAULT_ORDER_BY),
+        concurrency=_optional_int(data, "concurrency", 1),
+        chunk_concurrency=_optional_int(data, "chunk_concurrency", 1),
+        retention=_parse_retention(data.get("retention", {})),
+    )
 
 
 @dataclass(frozen=True)

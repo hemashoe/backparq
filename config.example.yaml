@@ -1,0 +1,71 @@
+# backparq configuration example
+
+# Database Connection Settings
+database:
+  # Connection info (DSN preferred via env var, but these are explicit)
+  host: "localhost"
+  port: 5432
+  name: "my_database"
+  user: "postgres"
+  password: "password" # Or use ${PG_PASSWORD}
+  # sslmode: "require" # Optional
+
+# S3 Storage Settings
+s3:
+  bucket: "my-backup-bucket"
+  prefix: "db-archive"
+  region: "us-east-1"
+  # Credentials (can be omitted if using EC2 metadata or AWS env vars)
+  access_key_id: "${AWS_ACCESS_KEY_ID}"
+  secret_access_key: "${AWS_SECRET_ACCESS_KEY}"
+
+  # Server-Side Encryption (S3-managed or KMS)
+  # sse: "aws:kms"
+  # kms_key_id: "alias/my-key"
+
+# Parquet Settings
+parquet:
+  compression: "snappy" # snappy, gzip, brotli, zstd
+
+  # Client-Side Encryption (Parquet Modular Encryption)
+  encryption:
+    enabled: false # Set to true to enable
+    # footer_key: "base64_encoded_master_key_32_bytes"
+    # key_map:
+    #   "key1": "base64_encoded_wrapping_key_1"
+    # column_keys:
+    #   "public.billing.credit_card": "key1"
+
+# Archive Job Settings
+archive:
+  # tables: List of tables to archive/backup
+  tables:
+    - public.example_table
+
+  # mode: "offload" OR "backup"
+  # "offload": Moves old data to S3 (archive/table/...) and allows deletion.
+  # "backup": Creates a full snapshot (backups/timestamp/table/...), NO deletion allowed.
+  mode: "offload"
+
+  # concurrency: Number of tables to process in parallel
+  concurrency: 1
+
+  # chunk_concurrency: Number of months to process in parallel WITHIN a table
+  chunk_concurrency: 4
+
+  # cutoff_exclusive:
+  #   For "offload": Data OLDER than this will be processed.
+  #   For "backup": Ignored (effectively 'now').
+  cutoff_exclusive: "2025-01-01T00:00:00Z"
+
+  # Delete rows from DB after successful upload?
+  perform_delete: false
+
+  # Safety flags
+  dry_run: true
+  overwrite: false
+
+# Cron Scheduling (Optional)
+cron:
+  enabled: false
+  schedule: "0 2 * * *" # Every day at 2 AM

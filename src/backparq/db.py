@@ -17,6 +17,9 @@ class ChunkSpec:
     end: dt.datetime
 
 
+from tenacity import retry, stop_after_attempt, wait_exponential
+
+@retry(stop=stop_after_attempt(5), wait=wait_exponential(multiplier=1, min=2, max=30))
 def connect_pg(config: DatabaseConfig):
     conn = psycopg2.connect(config.dsn())
     conn.autocommit = False
@@ -67,6 +70,15 @@ def pg_count_rows(conn, table: str, start: dt.datetime, end: dt.datetime) -> int
             (start, end),
         )
         return int(cur.fetchone()[0])
+
+
+def pg_get_columns(conn, table: str) -> list[str]:
+    """Returns a list of column names for the given table."""
+    # We can use information_schema or just select * limit 0
+    # efficient way:
+    with conn.cursor() as cur:
+        cur.execute(f"SELECT * FROM {table} LIMIT 0")
+        return [desc[0] for desc in cur.description]
 
 
 def list_chunks(conn, table: str, cutoff_exclusive: dt.datetime) -> list[ChunkSpec]:
@@ -201,3 +213,91 @@ def delete_chunk_safely(
             if deleted == 0:
                 break
     return total
+
+
+def _serialize_for_postgres(value):
+    import json
+    if isinstance(value, dict):
+        return json.dumps(value)
+    if isinstance(value, list):
+        parts = []
+        for x in value:
+            if x is None:
+                parts.append("NULL")
+            elif isinstance(x, str):
+                parts.append(f'"{x.replace(chr(92), chr(92)*2).replace(chr(34), chr(92)+chr(34))}"')
+            else:
+                parts.append(str(x))
+        return "{" + ",".join(parts) + "}"
+    return value
+
+
+def insert_arrow_table_to_pg(
+    conn,
+    table: str,
+    arrow_table,
+    conflict_mode: str = "do_nothing",
+    primary_key: Optional[str] = "id",
+    batch_size: int = 10_000,
+) -> int:
+    import io
+    import csv
+
+    if arrow_table.num_rows == 0:
+        return 0
+    
+    total_inserted = 0
+
+    for batch in arrow_table.to_batches(max_chunksize=batch_size):
+        rows = batch.to_pylist()
+        if not rows:
+            continue
+            
+        buf = io.StringIO()
+        writer = csv.writer(buf, delimiter='\t', quoting=csv.QUOTE_MINIMAL, quotechar='"')
+        
+        columns = arrow_table.column_names
+        
+        for row in rows:
+            csv_row = [_serialize_for_postgres(row[c]) for c in columns]
+            writer.writerow(csv_row)
+        
+        buf.seek(0)
+        
+        cols_str = ",".join(f'"{c}"' for c in columns)
+        
+        stage_table = f"stage_{int(time.time() * 1000000)}"
+
+        with conn.cursor() as cur:
+             # Create temp table if not exists (or always create/drop)
+            cur.execute(f"CREATE TEMP TABLE IF NOT EXISTS {stage_table} (LIKE {table} INCLUDING ALL) ON COMMIT DELETE ROWS")
+            
+            # COPY
+            # Use CSV format (Tab delimited to avoid comma issues, passed to csv.writer)
+            cur.copy_expert(f"COPY {stage_table} ({cols_str}) FROM STDIN WITH (FORMAT CSV, DELIMITER E'\t', QUOTE '\"', NULL '')", buf)
+            
+            # INSERT / UPSERT
+            if conflict_mode == "upsert":
+                if not primary_key:
+                    raise ValueError("primary_key is required for upsert mode")
+                    
+                set_clause = ", ".join(
+                    f'"{c}" = EXCLUDED."{c}"' for c in columns if c != primary_key
+                )
+                on_conflict = f"ON CONFLICT ({primary_key}) DO UPDATE SET {set_clause}"
+            else:
+                on_conflict = "ON CONFLICT DO NOTHING"
+
+            insert_sql = f"""
+                INSERT INTO {table} ({cols_str})
+                SELECT {cols_str} FROM {stage_table}
+                {on_conflict}
+            """
+            cur.execute(insert_sql)
+            total_inserted += cur.rowcount
+            
+            # Clear staging
+            cur.execute(f"TRUNCATE {stage_table}")
+    
+    conn.commit()
+    return total_inserted
