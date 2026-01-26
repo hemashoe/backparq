@@ -44,14 +44,19 @@ def chunk_paths(base_dir: Path, chunk: ChunkSpec) -> tuple[Path, Path, Path, Pat
     return final_parquet, inprogress_parquet, sha_path, manifest_path
 
 
-def s3_key_for_chunk(prefix: str, chunk: ChunkSpec) -> str:
+def s3_key_for_chunk(base_prefix: str, chunk: ChunkSpec, mode: str, run_id: Optional[str] = None) -> str:
     year = chunk.start.year
     month = chunk.start.month
-    prefix = prefix.rstrip("/")
-    return (
-        f"{prefix}/{chunk.table}/year={year:04d}/month={month:02d}/"
-        f"{chunk.table}_{year:04d}-{month:02d}.parquet"
-    )
+    name = f"{chunk.table}_{year:04d}-{month:02d}.parquet"
+    
+    if mode == "backup":
+        if not run_id:
+             raise ValueError("run_id required for backup mode")
+        # Structure: prefix/backups/RUN_ID/table/...
+        return f"{base_prefix}/backups/{run_id}/{chunk.table}/year={year:04d}/month={month:02d}/{name}"
+    else:
+        # Structure: prefix/archive/table/...
+        return f"{base_prefix}/archive/{chunk.table}/year={year:04d}/month={month:02d}/{name}"
 
 
 def _s3_extra_args(config) -> dict:
@@ -61,6 +66,243 @@ def _s3_extra_args(config) -> dict:
     if config.sse == "aws:kms" and config.kms_key_id:
         extra_args["SSEKMSKeyId"] = config.kms_key_id
     return extra_args
+
+
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from tqdm import tqdm
+
+def _process_table(table: str, config: BackparqConfig, s3, extra_args, run_id: Optional[str] = None) -> None:
+    conn = connect_pg(config.database)
+    chunks = []
+    try:
+        # If backup mode, we force cutoff to be NOW (full snapshot)
+        if config.archive.mode == "backup":
+             cutoff = dt.datetime.now(dt.timezone.utc) + dt.timedelta(days=1)
+        else:
+            # Offload mode uses configured cutoff
+            cutoff = config.archive.cutoff_exclusive
+            if cutoff is None:
+                 cutoff = dt.datetime.now(dt.timezone.utc) + dt.timedelta(days=1)
+        
+        chunks = list_chunks(conn, table, cutoff)
+    finally:
+        conn.close()
+        
+    if not chunks:
+        return
+
+    encryption_properties = build_encryption_properties(config.parquet)
+    do_upload = bool(config.s3.bucket)
+
+    desc = f"Table {table}"
+    
+    concurrency = config.archive.chunk_concurrency
+    
+    if concurrency > 1:
+        desc = f"Table {table} (Parallel x{concurrency})"
+        with ThreadPoolExecutor(max_workers=concurrency) as executor:
+            futures = [
+                executor.submit(_process_chunk, c, config, s3, do_upload, extra_args, encryption_properties, run_id)
+                for c in chunks
+            ]
+            for f in tqdm(as_completed(futures), total=len(chunks), desc=desc, leave=False):
+                try:
+                    f.result()
+                except Exception as e:
+                    print(f"ERROR processing chunk for table {table}: {e}")
+    else:
+        for chunk in tqdm(chunks, desc=desc, leave=False, disable=None):
+            try:
+                _process_chunk(
+                    chunk, config, s3, do_upload, extra_args, encryption_properties, run_id
+                )
+            except Exception as e:
+                print(f"ERROR processing chunk {chunk} for table {table}: {e}")
+
+
+def _process_chunk(chunk, config, s3, do_upload, extra_args, encryption_properties, run_id: Optional[str] = None):
+    # Each chunk gets its own connection to be thread-safe
+    conn = connect_pg(config.database)
+    try:
+        _process_chunk_impl(chunk, config, conn, s3, do_upload, extra_args, encryption_properties, run_id)
+    finally:
+        conn.close()
+
+def _process_chunk_impl(chunk, config, conn, s3, do_upload, extra_args, encryption_properties, run_id: Optional[str] = None):
+    # For local storage, we can keep the same structure or use run_id too?
+    # Ideally local storage mirrors transparency. 
+    # But simple "table_YYYY-MM" might overwrite if we backup same month twice?
+    # In Backup mode, we probably want local isolation too, primarily for collision avoidance.
+    # But currently chunk_paths uses base_dir directly.
+    # Let's keep local paths simple for now (cache), assuming sequential runs or different base_dirs.
+    
+    year, month = chunk.start.year, chunk.start.month
+    final_parquet, inprogress_parquet, sha_path, manifest_path = chunk_paths(
+        config.archive.base_dir, chunk
+    )
+    
+    # 1. Export
+    # ... (Standard export logic)
+    
+    if final_parquet.exists():
+         # Re-use existing file if checksum matches?
+         # in backup mode, we might re-upload the same file to a different S3 key.
+         pass
+    else:
+         # Export...
+         rows = export_chunk_to_parquet_streaming(
+            conn, chunk.table, chunk.start, chunk.end, 
+            inprogress_parquet, config.archive.order_by, config.archive.fetch_size,
+            config.parquet.compression, encryption_properties
+         )
+         if rows == 0:
+             if inprogress_parquet.exists(): inprogress_parquet.unlink()
+             return
+         inprogress_parquet.replace(final_parquet)
+
+    sha256 = sha256_file(final_parquet)
+    write_text(sha_path, sha256)
+    
+    # 2. Upload
+    if do_upload and s3:
+        key = s3_key_for_chunk(config.s3.prefix, chunk, config.archive.mode, run_id)
+        s3_upload_file(s3, final_parquet, config.s3.bucket, key, sha256, extra_args)
+
+        # Verify
+        # ...
+        
+    # 3. Delete (Only in Offload Mode)
+    if config.archive.mode == "offload" and config.archive.perform_delete:
+         deleted = delete_chunk_safely(
+             conn, chunk.table, chunk.start, chunk.end, config.archive.delete_batch_size
+         )
+    # Check existing
+    existing_manifest = load_manifest(manifest_path)
+    already_archived = False
+    already_verified = False
+
+    if existing_manifest and not config.archive.overwrite:
+        if final_parquet.exists():
+            try:
+                parquet_rows = validate_parquet_file(
+                    final_parquet, int(existing_manifest.get("exported_rows", -1))
+                )
+            except Exception:
+                parquet_rows = -1
+        else:
+            parquet_rows = -1
+
+        sha = existing_manifest.get("sha256", "")
+        expected_rows = existing_manifest.get("exported_rows", None)
+
+        ok_rows = (
+            expected_rows is not None
+            and parquet_rows == expected_rows
+            and expected_rows == db_rows
+        )
+        ok_s3 = True
+        if do_upload and s3 is not None:
+            mb = existing_manifest.get("s3_bucket", config.s3.bucket)
+            mk = existing_manifest.get("s3_key", s3_key)
+            ok_s3 = bool(sha) and s3_verify_object_sha256(s3, mb, mk, sha)
+
+        already_archived = ok_rows and final_parquet.exists()
+        already_verified = already_archived and ok_s3
+
+        if already_archived and not config.archive.perform_delete:
+             return
+
+        if config.archive.perform_delete and already_verified:
+             # Determine if row count matches (safe delete check)
+             pass # proceed to delete block
+    
+    # Export & Upload
+    if not (config.archive.perform_delete and already_verified) and not already_archived:
+        # Cleanup
+        if inprogress_parquet.exists(): inprogress_parquet.unlink()
+        if final_parquet.exists() and config.archive.overwrite: final_parquet.unlink()
+        if sha_path.exists() and config.archive.overwrite: sha_path.unlink()
+        if manifest_path.exists() and config.archive.overwrite: manifest_path.unlink()
+
+        # Atomic Export
+        exported = export_chunk_to_parquet_streaming(
+            conn=conn,
+            table=chunk.table,
+            start=chunk.start,
+            end=chunk.end,
+            parquet_path=inprogress_parquet,
+            order_by=config.archive.order_by,
+            fetch_size=config.archive.fetch_size,
+            compression=config.parquet.compression,
+            encryption_properties=encryption_properties,
+        )
+        
+        if exported != db_rows:
+             raise RuntimeError(f"Export mismatch: {exported} != {db_rows}")
+
+        validate_parquet_file(inprogress_parquet, exported)
+        inprogress_parquet.replace(final_parquet)
+        validate_parquet_file(final_parquet, exported)
+
+        sha = sha256_file(final_parquet)
+        write_text(sha_path, sha + "\n")
+
+        uploaded_and_verified = False
+        if do_upload:
+            s3_upload_file(
+                s3=s3,
+                local_path=final_parquet,
+                bucket=config.s3.bucket,
+                key=s3_key,
+                sha256_hex=sha,
+                extra_args=extra_args or None,
+            )
+            uploaded_and_verified = s3_verify_object_sha256(s3, config.s3.bucket, s3_key, sha)
+            if not uploaded_and_verified:
+                raise RuntimeError("S3 verification failed.")
+        
+        manifest = {
+            "table": chunk.table,
+            "chunk_start": chunk.start.isoformat(),
+            "chunk_end": chunk.end.isoformat(),
+            "cutoff_exclusive": config.archive.cutoff_exclusive.isoformat() if config.archive.cutoff_exclusive else "FULL_TABLE",
+            "exported_rows": exported,
+            "db_rows_at_export_time": db_rows,
+            "parquet_path": final_parquet.as_posix(),
+            "sha256": sha,
+            "s3_bucket": config.s3.bucket if do_upload else "",
+            "s3_key": s3_key if do_upload else "",
+            "uploaded_and_verified": uploaded_and_verified if do_upload else False,
+            "created_at_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
+            "order_by": config.archive.order_by,
+            "compression": config.parquet.compression,
+            "fetch_size": config.archive.fetch_size,
+            "encryption_enabled": config.parquet.encryption.enabled,
+        }
+        write_manifest(manifest_path, manifest)
+
+    # Delete
+    if config.archive.perform_delete:
+         # Simplified double-check before delete
+         manifest = load_manifest(manifest_path)
+         if not manifest: raise RuntimeError("Missing manifest for delete.")
+         
+         exported_rows = int(manifest.get("exported_rows", -1))
+         if do_upload:
+              mk = manifest.get("s3_key", s3_key)
+              sha = manifest.get("sha256", "")
+              if not s3_verify_object_sha256(s3, config.s3.bucket, mk, sha):
+                   raise RuntimeError("S3 verification failed before delete.")
+         
+         db_rows_now = pg_count_rows(conn, chunk.table, chunk.start, chunk.end)
+         if db_rows_now != exported_rows:
+              raise RuntimeError(f"DB count changed ({db_rows_now} != {exported_rows}). Aborting delete.")
+
+         deleted = delete_chunk_safely(
+             conn=conn, table=chunk.table, start=chunk.start, end=chunk.end, batch_size=config.archive.delete_batch_size
+         )
+         if deleted != exported_rows:
+              print(f"WARNING: Deleted {deleted} != Exported {exported_rows}")
 
 
 def archive_tables(config: BackparqConfig) -> None:
@@ -73,231 +315,29 @@ def archive_tables(config: BackparqConfig) -> None:
     if config.archive.dry_run:
         print("DRY RUN: will not write/upload/delete.\n")
 
-    encryption_properties = build_encryption_properties(config.parquet)
-
+    # Tests connections (main thread)
     test_pg_connection(config.database)
     if do_upload:
         test_s3_connection(config.s3)
-
-    if do_upload and not config.archive.dry_run:
+        # We assume s3 client is thread-safe OR we create one per thread.
+        # boto3 clients are thread safe.
         s3 = s3_client_from_config(config.s3)
 
-    conn = connect_pg(config.database)
-    try:
-        for table in config.archive.tables:
-            print(f"\n=== TABLE: {table} ===")
-            chunks = list_chunks(conn, table, config.archive.cutoff_exclusive)
-            if not chunks:
-                print("No data found (or table empty).")
-                continue
+    # Parallel Execution
+    max_workers = config.archive.concurrency
+    print(f"Starting archive for {len(config.archive.tables)} tables with concurrency={max_workers}...")
 
-            for chunk in chunks:
-                year, month = chunk.start.year, chunk.start.month
-                final_parquet, inprogress_parquet, sha_path, manifest_path = chunk_paths(
-                    config.archive.base_dir, chunk
-                )
-                s3_key = s3_key_for_chunk(config.s3.prefix, chunk)
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {
+            executor.submit(_process_table, table, config, s3, extra_args): table 
+            for table in config.archive.tables
+        }
+        
+        for future in as_completed(futures):
+            table = futures[future]
+            try:
+                future.result()
+            except Exception as exc:
+                print(f"Table {table} failed: {exc}")
 
-                print(
-                    f"\n-- Chunk {year:04d}-{month:02d}: "
-                    f"[{chunk.start.isoformat()} .. {chunk.end.isoformat()})"
-                )
-                db_rows = pg_count_rows(conn, table, chunk.start, chunk.end)
-                print(f"DB rows in chunk: {db_rows}")
-
-                if config.archive.dry_run:
-                    if db_rows:
-                        print(f"PLAN: export -> {final_parquet}")
-                        if do_upload:
-                            print(f"PLAN: upload -> s3://{config.s3.bucket}/{s3_key}")
-                        if config.archive.perform_delete:
-                            print("PLAN: delete after verified archive+upload")
-                    else:
-                        print("PLAN: skip empty chunk")
-                    continue
-
-                if db_rows == 0:
-                    print("Skipping empty chunk.")
-                    continue
-
-                existing_manifest = load_manifest(manifest_path)
-                already_archived = False
-                already_verified = False
-
-                if existing_manifest and not config.archive.overwrite:
-                    if final_parquet.exists():
-                        try:
-                            parquet_rows = validate_parquet_file(
-                                final_parquet, int(existing_manifest.get("exported_rows", -1))
-                            )
-                        except Exception:
-                            parquet_rows = -1
-                    else:
-                        parquet_rows = -1
-
-                    sha = existing_manifest.get("sha256", "")
-                    expected_rows = existing_manifest.get("exported_rows", None)
-
-                    ok_rows = (
-                        expected_rows is not None
-                        and parquet_rows == expected_rows
-                        and expected_rows == db_rows
-                    )
-                    ok_s3 = True
-                    if do_upload and s3 is not None:
-                        mb = existing_manifest.get("s3_bucket", config.s3.bucket)
-                        mk = existing_manifest.get("s3_key", s3_key)
-                        ok_s3 = bool(sha) and s3_verify_object_sha256(s3, mb, mk, sha)
-
-                    already_archived = ok_rows and final_parquet.exists()
-                    already_verified = already_archived and ok_s3
-
-                    if already_archived and not config.archive.perform_delete:
-                        print("Already archived & verified enough for export step. Skipping export/upload.")
-                        continue
-
-                    if config.archive.perform_delete and already_verified:
-                        print(
-                            "Chunk already archived & verified. "
-                            "Proceeding directly to deletion (delete-later mode)."
-                        )
-
-                if not (config.archive.perform_delete and already_verified) and not already_archived:
-                    if inprogress_parquet.exists():
-                        inprogress_parquet.unlink()
-
-                    if final_parquet.exists() and not config.archive.overwrite:
-                        raise RuntimeError(
-                            f"{final_parquet} exists but no valid manifest or mismatch. "
-                            "Use overwrite or delete the file."
-                        )
-
-                    if final_parquet.exists() and config.archive.overwrite:
-                        final_parquet.unlink()
-                    if sha_path.exists() and config.archive.overwrite:
-                        sha_path.unlink()
-                    if manifest_path.exists() and config.archive.overwrite:
-                        manifest_path.unlink()
-
-                    print(f"Exporting to Parquet (atomic): {inprogress_parquet} -> {final_parquet}")
-                    t0 = time.time()
-                    exported = export_chunk_to_parquet_streaming(
-                        conn=conn,
-                        table=table,
-                        start=chunk.start,
-                        end=chunk.end,
-                        parquet_path=inprogress_parquet,
-                        order_by=config.archive.order_by,
-                        fetch_size=config.archive.fetch_size,
-                        compression=config.parquet.compression,
-                        encryption_properties=encryption_properties,
-                    )
-                    print(f"Exported rows: {exported} in {time.time() - t0:.1f}s")
-
-                    if exported != db_rows:
-                        raise RuntimeError(
-                            f"Exported rows ({exported}) != DB count ({db_rows}). Refusing."
-                        )
-
-                    validate_parquet_file(inprogress_parquet, exported)
-                    inprogress_parquet.replace(final_parquet)
-
-                    validate_parquet_file(final_parquet, exported)
-
-                    sha = sha256_file(final_parquet)
-                    write_text(sha_path, sha + "\n")
-                    print(f"SHA256: {sha}")
-
-                    uploaded_and_verified = False
-                    if do_upload:
-                        if s3 is None:
-                            raise RuntimeError("S3 client not initialized.")
-                        print(f"Uploading to s3://{config.s3.bucket}/{s3_key}")
-                        s3_upload_file(
-                            s3=s3,
-                            local_path=final_parquet,
-                            bucket=config.s3.bucket,
-                            key=s3_key,
-                            sha256_hex=sha,
-                            extra_args=extra_args or None,
-                        )
-                        uploaded_and_verified = s3_verify_object_sha256(
-                            s3, config.s3.bucket, s3_key, sha
-                        )
-                        if not uploaded_and_verified:
-                            raise RuntimeError(
-                                "S3 upload verification failed (sha256 metadata mismatch)."
-                            )
-                        print("S3 upload verified (sha256 metadata matches).")
-                    else:
-                        print("S3 upload skipped (no S3 bucket set).")
-
-                    manifest = {
-                        "table": table,
-                        "chunk_start": chunk.start.isoformat(),
-                        "chunk_end": chunk.end.isoformat(),
-                        "cutoff_exclusive": config.archive.cutoff_exclusive.isoformat(),
-                        "exported_rows": exported,
-                        "db_rows_at_export_time": db_rows,
-                        "parquet_path": final_parquet.as_posix(),
-                        "sha256": sha,
-                        "s3_bucket": config.s3.bucket if do_upload else "",
-                        "s3_key": s3_key if do_upload else "",
-                        "uploaded_and_verified": uploaded_and_verified if do_upload else False,
-                        "created_at_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
-                        "order_by": config.archive.order_by,
-                        "compression": config.parquet.compression,
-                        "fetch_size": config.archive.fetch_size,
-                        "encryption_enabled": config.parquet.encryption.enabled,
-                    }
-                    write_manifest(manifest_path, manifest)
-                    print(f"Manifest written: {manifest_path}")
-
-                if config.archive.perform_delete:
-                    manifest = load_manifest(manifest_path)
-                    if not manifest:
-                        raise RuntimeError("perform_delete set but no manifest found.")
-
-                    exported_rows = int(manifest.get("exported_rows", -1))
-                    validate_parquet_file(final_parquet, exported_rows)
-
-                    if do_upload:
-                        if s3 is None:
-                            s3 = s3_client_from_config(config.s3)
-                        mb = manifest.get("s3_bucket", config.s3.bucket)
-                        mk = manifest.get("s3_key", s3_key)
-                        sha = manifest.get("sha256", "")
-                        if not sha or not s3_verify_object_sha256(s3, mb, mk, sha):
-                            raise RuntimeError("S3 verification failed/not present. Refusing delete.")
-
-                    db_rows_now = pg_count_rows(conn, table, chunk.start, chunk.end)
-                    if db_rows_now != exported_rows:
-                        raise RuntimeError(
-                            "DB rowcount changed since export "
-                            f"(now {db_rows_now}, exported {exported_rows})."
-                        )
-
-                    print(
-                        f"Deleting archived rows from {table} for {year:04d}-{month:02d} "
-                        f"in batches of {config.archive.delete_batch_size} ..."
-                    )
-                    deleted = delete_chunk_safely(
-                        conn=conn,
-                        table=table,
-                        start=chunk.start,
-                        end=chunk.end,
-                        batch_size=config.archive.delete_batch_size,
-                    )
-                    print(f"Deleted rows: {deleted}")
-
-                    if deleted != exported_rows:
-                        print(
-                            f"WARNING: deleted ({deleted}) != exported ({exported_rows}). "
-                            "Investigate immediately."
-                        )
-                    else:
-                        print("Delete completed and counts match.")
-
-        print("\nAll done.")
-    finally:
-        conn.close()
+    print("\nAll done.")

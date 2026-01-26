@@ -7,6 +7,8 @@ from botocore.config import Config
 from backparq.config import S3Config
 
 
+from tenacity import retry,  stop_after_attempt, wait_exponential
+
 def s3_client_from_config(config: S3Config):
     s3_config = None
     if config.addressing_style:
@@ -34,6 +36,7 @@ def test_s3_connection(config: S3Config) -> None:
         raise RuntimeError(f"S3 bucket not reachable: {config.bucket}") from exc
 
 
+@retry(stop=stop_after_attempt(5), wait=wait_exponential(multiplier=1, min=2, max=60))
 def s3_upload_file(
     s3,
     local_path,

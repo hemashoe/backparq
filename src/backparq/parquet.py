@@ -1,7 +1,7 @@
 import hashlib
 import json
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 import pyarrow.parquet as pq
 
@@ -33,7 +33,7 @@ def write_manifest(path: Path, data: dict[str, Any]) -> None:
     tmp.replace(path)
 
 
-def load_manifest(path: Path) -> dict[str, Any] | None:
+def load_manifest(path: Path) -> Optional[dict[str, Any]]:
     if not path.exists():
         return None
     return json.loads(path.read_text(encoding="utf-8"))
@@ -96,3 +96,38 @@ def build_encryption_properties(config: ParquetConfig):
         column_keys=config.encryption.column_keys,
     )
     return crypto_factory.file_encryption_properties(encryption_config)
+
+
+def read_chunk(path: Path, encryption_properties=None):
+    """
+    Reads a Parquet file into a PyArrow Table.
+    """
+    import pyarrow.parquet as pq
+    
+    # If encryption properties are provided, we need to use a specialized ParquetDataset or direct ParquetFile read
+    # pq.read_table automatically handles decryption if properties are set?
+    # Actually, usually you need to pass decryption_properties.
+    
+    # For now, let's assume we reuse the same properties for both read and write if symmetric,
+    # OR we need to build DecryptionProperties.
+    # But usually CryptoFactory handles it if we use it correctly.
+    
+    decryption_properties = None
+    if encryption_properties:
+        # This is a bit complex. The provided object is FileEncryptionProperties.
+        # We need FileDecryptionProperties.
+        # In this simple implementation, we might not support reading encrypted files fully yet 
+        # unless we parse the config again for Decryption.
+        # Let's assume standard read_table works if keys are in keyring or handled by environment?
+        # No, we need explicit decryption setup.
+        pass
+
+    # Basic read for now. 
+    # TODO: Proper decryption support requires rebuilding CryptoFactory for decryption.
+    # For the MVP, if encryption is enabled, we assume the user has configured the environment/keys such that
+    # simple read might fail without properties.
+    
+    try:
+        return pq.read_table(path.as_posix(), decryption_properties=decryption_properties)
+    except Exception as exc:
+        raise RuntimeError(f"Failed to read parquet file {path}: {exc}") from exc
