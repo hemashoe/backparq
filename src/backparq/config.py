@@ -1,22 +1,41 @@
-import dataclasses
+"""
+Backparq Configuration Module
+
+Handles loading, parsing, and validating YAML configuration files.
+Supports environment variable expansion and config file includes.
+"""
+
 import datetime as dt
+import logging
 import os
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
 
 import yaml
 
-REQUIRED_BASE_DIR = Path("/mnt/HC_Volume_101950313/db-archive-data").resolve()
-DEFAULT_CUTOFF_EXCLUSIVE = "2025-08-01"
+logger = logging.getLogger(__name__)
+
+# Defaults - no longer hardcoded restrictions
+DEFAULT_BASE_DIR = Path.cwd() / "backparq-data"
+DEFAULT_CUTOFF_EXCLUSIVE = ""  # Empty means no cutoff (full table)
 DEFAULT_S3_PREFIX = "db-archive"
 DEFAULT_ORDER_BY = "created_at"
 DEFAULT_COMPRESSION = "snappy"
+DEFAULT_PRIMARY_KEY = "id"
+
+
+class ConfigError(ValueError):
+    """Raised when configuration is invalid."""
+
+    pass
 
 
 @dataclass(frozen=True)
 class DatabaseConfig:
+    """PostgreSQL connection configuration."""
+
     host: str
     port: int
     name: str
@@ -41,6 +60,8 @@ class DatabaseConfig:
 
 @dataclass(frozen=True)
 class S3Config:
+    """S3 storage configuration."""
+
     bucket: str
     prefix: str = DEFAULT_S3_PREFIX
     region: Optional[str] = None
@@ -57,31 +78,48 @@ class S3Config:
 
 @dataclass(frozen=True)
 class ParquetEncryptionConfig:
+    """Parquet encryption configuration (optional)."""
+
     enabled: bool = False
     footer_key: str = ""
-    column_keys: dict[str, str] = dataclasses.field(default_factory=dict)
-    key_map: dict[str, str] = dataclasses.field(default_factory=dict)
+    column_keys: dict[str, str] = field(default_factory=dict)
+    key_map: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
 class ParquetConfig:
+    """Parquet file configuration."""
+
     compression: str = DEFAULT_COMPRESSION
-    encryption: ParquetEncryptionConfig = dataclasses.field(
-        default_factory=ParquetEncryptionConfig
-    )
+    encryption: ParquetEncryptionConfig = field(default_factory=ParquetEncryptionConfig)
 
 
 @dataclass(frozen=True)
 class RetentionConfig:
+    """Retention policy for pruning old backups."""
+
     enabled: bool = False
     days: int = 0
     months: int = 0
 
 
 @dataclass(frozen=True)
+class TableConfig:
+    """Per-table configuration including primary key."""
+
+    name: str
+    primary_key: str = DEFAULT_PRIMARY_KEY
+
+    def __str__(self) -> str:
+        return self.name
+
+
+@dataclass(frozen=True)
 class ArchiveConfig:
-    tables: list[str]
-    mode: str # "backup" or "offload"
+    """Archive job configuration."""
+
+    tables: list[TableConfig]
+    mode: str  # "backup" or "offload"
     cutoff_exclusive: Optional[dt.datetime]
     base_dir: Path
     fetch_size: int = 10_000
@@ -92,63 +130,34 @@ class ArchiveConfig:
     order_by: str = DEFAULT_ORDER_BY
     concurrency: int = 1
     chunk_concurrency: int = 1
-    retention: RetentionConfig = dataclasses.field(default_factory=RetentionConfig)
+    retention: RetentionConfig = field(default_factory=RetentionConfig)
 
     def __post_init__(self):
         if self.mode not in ("backup", "offload"):
             raise ConfigError(f"Invalid mode '{self.mode}'. Must be 'backup' or 'offload'.")
         if self.mode == "backup" and self.perform_delete:
-            raise ConfigError("Creation of 'backup' snapshots (backup mode) cannot be combined with 'perform_delete'. This is strictly for keeping full snapshots.")
+            raise ConfigError(
+                "Mode 'backup' cannot be combined with 'perform_delete'. "
+                "Backup mode creates full snapshots without deletion."
+            )
 
+    def get_table_config(self, table_name: str) -> TableConfig:
+        """Get config for a specific table by name."""
+        for tc in self.tables:
+            if tc.name == table_name:
+                return tc
+        raise ConfigError(f"Table '{table_name}' not found in config.")
 
-def _parse_retention(data: dict[str, Any]) -> RetentionConfig:
-    if not data:
-        return RetentionConfig()
-    
-    return RetentionConfig(
-        enabled=_optional_bool(data, "enabled", False),
-        days=_optional_int(data, "days", 0),
-        months=_optional_int(data, "months", 0),
-    )
-
-
-def _parse_archive(data: dict[str, Any]) -> ArchiveConfig:
-    tables = data.get("tables")
-    if not isinstance(tables, list) or not tables:
-        raise ConfigError("'archive.tables' must be a non-empty list.")
-    cleaned_tables = []
-    for table in tables:
-        if not isinstance(table, str) or not table.strip():
-            raise ConfigError("'archive.tables' must contain only strings.")
-        cleaned_tables.append(table.strip())
-
-    mode = _optional_str(data, "mode", "offload").lower()
-
-    cutoff_raw = _optional_str(data, "cutoff_exclusive", "")
-    cutoff = parse_utc_datetime(cutoff_raw) if cutoff_raw else None
-    
-    base_dir = Path(_optional_str(data, "base_dir", str(REQUIRED_BASE_DIR))).resolve()
-    ensure_under_base_dir(base_dir)
-
-    return ArchiveConfig(
-        tables=cleaned_tables,
-        mode=mode,
-        cutoff_exclusive=cutoff,
-        base_dir=base_dir,
-        fetch_size=_optional_int(data, "fetch_size", 10_000),
-        overwrite=_optional_bool(data, "overwrite", False),
-        dry_run=_optional_bool(data, "dry_run", False),
-        perform_delete=_optional_bool(data, "perform_delete", False),
-        delete_batch_size=_optional_int(data, "delete_batch_size", 10_000),
-        order_by=_optional_str(data, "order_by", DEFAULT_ORDER_BY),
-        concurrency=_optional_int(data, "concurrency", 1),
-        chunk_concurrency=_optional_int(data, "chunk_concurrency", 1),
-        retention=_parse_retention(data.get("retention", {})),
-    )
+    @property
+    def table_names(self) -> list[str]:
+        """Return list of table names for iteration."""
+        return [t.name for t in self.tables]
 
 
 @dataclass(frozen=True)
 class CronConfig:
+    """Cron scheduling configuration."""
+
     enabled: bool = False
     schedule: str = ""
     command: str = ""
@@ -156,18 +165,24 @@ class CronConfig:
 
 @dataclass(frozen=True)
 class BackparqConfig:
+    """Root configuration object."""
+
     database: DatabaseConfig
     s3: S3Config
     parquet: ParquetConfig
     archive: ArchiveConfig
-    cron: CronConfig = dataclasses.field(default_factory=CronConfig)
+    cron: CronConfig = field(default_factory=CronConfig)
 
 
-class ConfigError(ValueError):
-    pass
+# =============================================================================
+# Parsing Utilities
+# =============================================================================
 
 
 def parse_utc_datetime(value: str) -> dt.datetime:
+    """Parse a datetime string to UTC timezone-aware datetime."""
+    if not value:
+        raise ConfigError("Empty datetime string")
     if "T" in value:
         parsed = dt.datetime.fromisoformat(value)
     else:
@@ -177,13 +192,8 @@ def parse_utc_datetime(value: str) -> dt.datetime:
     return parsed.astimezone(dt.timezone.utc)
 
 
-def ensure_under_base_dir(path: Path) -> None:
-    resolved = path.resolve()
-    if REQUIRED_BASE_DIR not in resolved.parents and resolved != REQUIRED_BASE_DIR:
-        raise ConfigError(f"Refusing to write outside {REQUIRED_BASE_DIR}. Got: {resolved}")
-
-
 def _require_section(data: dict[str, Any], key: str) -> dict[str, Any]:
+    """Require a config section to exist and be a dict."""
     value = data.get(key)
     if value is None or not isinstance(value, dict):
         raise ConfigError(f"Missing or invalid '{key}' section in config.")
@@ -191,6 +201,7 @@ def _require_section(data: dict[str, Any], key: str) -> dict[str, Any]:
 
 
 def _require_str(data: dict[str, Any], key: str) -> str:
+    """Require a non-empty string value."""
     value = data.get(key)
     if not isinstance(value, str) or not value.strip():
         raise ConfigError(f"Missing or invalid '{key}' value in config.")
@@ -198,15 +209,17 @@ def _require_str(data: dict[str, Any], key: str) -> str:
 
 
 def _optional_str(data: dict[str, Any], key: str, default: str = "") -> str:
+    """Get optional string value with default."""
     value = data.get(key, default)
     if value is None:
         return default
     if not isinstance(value, str):
-        raise ConfigError(f"Invalid '{key}' value in config.")
+        raise ConfigError(f"Invalid '{key}' value in config; must be string.")
     return value.strip()
 
 
 def _optional_int(data: dict[str, Any], key: str, default: int) -> int:
+    """Get optional integer value with default."""
     value = data.get(key, default)
     if isinstance(value, bool):
         raise ConfigError(f"Invalid '{key}' value in config (bool not allowed).")
@@ -217,6 +230,7 @@ def _optional_int(data: dict[str, Any], key: str, default: int) -> int:
 
 
 def _optional_bool(data: dict[str, Any], key: str, default: bool = False) -> bool:
+    """Get optional boolean value with default."""
     value = data.get(key, default)
     if isinstance(value, bool):
         return value
@@ -224,6 +238,7 @@ def _optional_bool(data: dict[str, Any], key: str, default: bool = False) -> boo
 
 
 def _optional_str_map(data: dict[str, Any], key: str) -> dict[str, str]:
+    """Get optional string->string mapping."""
     value = data.get(key, {})
     if value is None:
         return {}
@@ -237,7 +252,13 @@ def _optional_str_map(data: dict[str, Any], key: str) -> dict[str, str]:
     return parsed
 
 
+# =============================================================================
+# Section Parsers
+# =============================================================================
+
+
 def _parse_database(data: dict[str, Any]) -> DatabaseConfig:
+    """Parse database configuration section."""
     return DatabaseConfig(
         host=_require_str(data, "host"),
         port=_optional_int(data, "port", 5432),
@@ -250,6 +271,7 @@ def _parse_database(data: dict[str, Any]) -> DatabaseConfig:
 
 
 def _parse_s3(data: dict[str, Any]) -> S3Config:
+    """Parse S3 configuration section."""
     return S3Config(
         bucket=_require_str(data, "bucket"),
         prefix=_optional_str(data, "prefix", DEFAULT_S3_PREFIX),
@@ -267,6 +289,7 @@ def _parse_s3(data: dict[str, Any]) -> S3Config:
 
 
 def _parse_parquet(data: dict[str, Any]) -> ParquetConfig:
+    """Parse Parquet configuration section."""
     encryption_data = data.get("encryption", {})
     if encryption_data is None:
         encryption_data = {}
@@ -286,23 +309,74 @@ def _parse_parquet(data: dict[str, Any]) -> ParquetConfig:
     )
 
 
-def _parse_archive(data: dict[str, Any]) -> ArchiveConfig:
-    tables = data.get("tables")
-    if not isinstance(tables, list) or not tables:
-        raise ConfigError("'archive.tables' must be a non-empty list.")
-    cleaned_tables = []
-    for table in tables:
-        if not isinstance(table, str) or not table.strip():
-            raise ConfigError("'archive.tables' must contain only strings.")
-        cleaned_tables.append(table.strip())
+def _parse_retention(data: dict[str, Any]) -> RetentionConfig:
+    """Parse retention configuration section."""
+    if not data:
+        return RetentionConfig()
 
-    cutoff = _optional_str(data, "cutoff_exclusive", DEFAULT_CUTOFF_EXCLUSIVE)
-    base_dir = Path(_optional_str(data, "base_dir", str(REQUIRED_BASE_DIR))).resolve()
-    ensure_under_base_dir(base_dir)
+    return RetentionConfig(
+        enabled=_optional_bool(data, "enabled", False),
+        days=_optional_int(data, "days", 0),
+        months=_optional_int(data, "months", 0),
+    )
+
+
+def _parse_tables(tables_data: list) -> list[TableConfig]:
+    """
+    Parse tables configuration.
+
+    Supports both simple strings and dicts with per-table config:
+    tables:
+      - public.events                    # Simple string
+      - table: public.orders             # Dict with options
+        primary_key: order_id
+    """
+    if not isinstance(tables_data, list) or not tables_data:
+        raise ConfigError("'archive.tables' must be a non-empty list.")
+
+    parsed_tables: list[TableConfig] = []
+    for item in tables_data:
+        if isinstance(item, str):
+            if not item.strip():
+                raise ConfigError("'archive.tables' must not contain empty strings.")
+            parsed_tables.append(TableConfig(name=item.strip()))
+        elif isinstance(item, dict):
+            table_name = item.get("table") or item.get("name")
+            if not isinstance(table_name, str) or not table_name.strip():
+                raise ConfigError("Table config must have 'table' or 'name' key with string value.")
+            pk = _optional_str(item, "primary_key", DEFAULT_PRIMARY_KEY)
+            parsed_tables.append(TableConfig(name=table_name.strip(), primary_key=pk))
+        else:
+            raise ConfigError(f"Invalid table entry: {item}. Must be string or dict.")
+
+    return parsed_tables
+
+
+def _parse_archive(data: dict[str, Any]) -> ArchiveConfig:
+    """Parse archive configuration section."""
+    tables = _parse_tables(data.get("tables", []))
+    mode = _optional_str(data, "mode", "offload").lower()
+
+    # Cutoff is optional - empty means no cutoff (process all data)
+    cutoff_raw = _optional_str(data, "cutoff_exclusive", "")
+    cutoff = parse_utc_datetime(cutoff_raw) if cutoff_raw else None
+
+    # Base directory - configurable, defaults to ./backparq-data
+    base_dir_str = _optional_str(data, "base_dir", str(DEFAULT_BASE_DIR))
+    base_dir = Path(base_dir_str).resolve()
+
+    # Ensure directory exists or can be created
+    if not base_dir.exists():
+        try:
+            base_dir.mkdir(parents=True, exist_ok=True)
+            logger.info(f"Created base directory: {base_dir}")
+        except OSError as e:
+            raise ConfigError(f"Cannot create base directory {base_dir}: {e}") from e
 
     return ArchiveConfig(
-        tables=cleaned_tables,
-        cutoff_exclusive=parse_utc_datetime(cutoff),
+        tables=tables,
+        mode=mode,
+        cutoff_exclusive=cutoff,
         base_dir=base_dir,
         fetch_size=_optional_int(data, "fetch_size", 10_000),
         overwrite=_optional_bool(data, "overwrite", False),
@@ -310,10 +384,14 @@ def _parse_archive(data: dict[str, Any]) -> ArchiveConfig:
         perform_delete=_optional_bool(data, "perform_delete", False),
         delete_batch_size=_optional_int(data, "delete_batch_size", 10_000),
         order_by=_optional_str(data, "order_by", DEFAULT_ORDER_BY),
+        concurrency=_optional_int(data, "concurrency", 1),
+        chunk_concurrency=_optional_int(data, "chunk_concurrency", 1),
+        retention=_parse_retention(data.get("retention", {})),
     )
 
 
 def _parse_cron(data: Optional[dict[str, Any]]) -> CronConfig:
+    """Parse cron configuration section."""
     if not data:
         return CronConfig()
     if not isinstance(data, dict):
@@ -326,7 +404,13 @@ def _parse_cron(data: Optional[dict[str, Any]]) -> CronConfig:
     )
 
 
+# =============================================================================
+# YAML Loading and Environment Expansion
+# =============================================================================
+
+
 def _load_yaml(path: Path) -> dict[str, Any]:
+    """Load and parse a YAML configuration file."""
     if not path.exists():
         raise ConfigError(f"Config file not found: {path}")
     raw = yaml.safe_load(path.read_text(encoding="utf-8"))
@@ -338,13 +422,10 @@ def _load_yaml(path: Path) -> dict[str, Any]:
 
 
 def _merge_dicts(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
+    """Deep merge two dictionaries, with override taking precedence."""
     merged = dict(base)
     for key, value in override.items():
-        if (
-            key in merged
-            and isinstance(merged[key], dict)
-            and isinstance(value, dict)
-        ):
+        if key in merged and isinstance(merged[key], dict) and isinstance(value, dict):
             merged[key] = _merge_dicts(merged[key], value)
         else:
             merged[key] = value
@@ -355,11 +436,13 @@ _ENV_PATTERN = re.compile(r"\$\{([^}]+)\}")
 
 
 def _expand_env(value: Any) -> Any:
+    """Recursively expand ${VAR} and ${VAR:default} patterns."""
     if isinstance(value, dict):
         return {key: _expand_env(val) for key, val in value.items()}
     if isinstance(value, list):
         return [_expand_env(item) for item in value]
     if isinstance(value, str):
+
         def _replace(match: re.Match[str]) -> str:
             raw_key = match.group(1)
             if ":" in raw_key:
@@ -372,8 +455,25 @@ def _expand_env(value: Any) -> Any:
     return value
 
 
+# =============================================================================
+# Main Configuration Loader
+# =============================================================================
+
+
 def load_config(path: Path) -> BackparqConfig:
+    """
+    Load and validate configuration from a YAML file.
+
+    Supports:
+    - Environment variable expansion: ${VAR} or ${VAR:default}
+    - Config file includes via 'include' key
+    - Per-table primary key configuration
+    - Optional encryption
+    """
+    logger.info(f"Loading configuration from: {path}")
     raw = _load_yaml(path)
+
+    # Handle includes
     include = raw.pop("include", None)
     merged: dict[str, Any] = {}
     if include:
@@ -381,30 +481,38 @@ def load_config(path: Path) -> BackparqConfig:
         for include_path in include_paths:
             if not isinstance(include_path, str):
                 raise ConfigError("Config 'include' entries must be file paths.")
-            merged = _merge_dicts(
-                merged,
-                _load_yaml((path.parent / include_path).resolve()),
-            )
+            include_file = (path.parent / include_path).resolve()
+            logger.debug(f"Including config: {include_file}")
+            merged = _merge_dicts(merged, _load_yaml(include_file))
+
     merged = _merge_dicts(merged, raw)
     merged = _expand_env(merged)
 
+    # Parse sections
     database = _parse_database(_require_section(merged, "database"))
     s3 = _parse_s3(_require_section(merged, "s3"))
-    parquet = _parse_parquet(_require_section(merged, "parquet"))
+    parquet = _parse_parquet(merged.get("parquet", {}))
     archive = _parse_archive(_require_section(merged, "archive"))
     cron = _parse_cron(merged.get("cron"))
 
-    if not parquet.encryption.enabled:
-        raise ConfigError("Parquet encryption must be enabled in the config.")
+    # Validate encryption config (only if enabled)
+    if parquet.encryption.enabled:
+        if not parquet.encryption.footer_key:
+            raise ConfigError("Parquet encryption enabled but 'footer_key' missing.")
+        if not parquet.encryption.key_map:
+            raise ConfigError("Parquet encryption enabled but 'key_map' missing.")
+        logger.info("Parquet encryption is enabled")
+    else:
+        logger.debug("Parquet encryption is disabled")
 
-    if not parquet.encryption.footer_key:
-        raise ConfigError("Parquet encryption enabled but 'footer_key' missing.")
-    if not parquet.encryption.key_map:
-        raise ConfigError("Parquet encryption enabled but 'key_map' missing.")
+    # Validate S3 addressing style
     if s3.addressing_style and s3.addressing_style not in {"path", "virtual", "auto"}:
-        raise ConfigError(
-            "Invalid s3.addressing_style; expected 'path', 'virtual', or 'auto'."
-        )
+        raise ConfigError("Invalid s3.addressing_style; expected 'path', 'virtual', or 'auto'.")
+
+    logger.info(
+        f"Configuration loaded: {len(archive.tables)} tables, "
+        f"mode={archive.mode}, concurrency={archive.concurrency}"
+    )
 
     return BackparqConfig(
         database=database,

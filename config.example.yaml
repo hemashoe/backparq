@@ -1,14 +1,15 @@
-# backparq configuration example
+# Backparq configuration example
+# See README.md for full documentation
 
 # Database Connection Settings
 database:
-  # Connection info (DSN preferred via env var, but these are explicit)
   host: "localhost"
   port: 5432
   name: "my_database"
   user: "postgres"
-  password: "password" # Or use ${PG_PASSWORD}
-  # sslmode: "require" # Optional
+  password: "${PG_PASSWORD}" # Use environment variable
+  # sslmode: "require"  # Optional: require, verify-ca, verify-full
+  # connect_timeout: 10
 
 # S3 Storage Settings
 s3:
@@ -19,17 +20,21 @@ s3:
   access_key_id: "${AWS_ACCESS_KEY_ID}"
   secret_access_key: "${AWS_SECRET_ACCESS_KEY}"
 
-  # Server-Side Encryption (S3-managed or KMS)
+  # Server-Side Encryption (optional)
   # sse: "aws:kms"
   # kms_key_id: "alias/my-key"
+
+  # For S3-compatible storage (MinIO, etc.)
+  # endpoint_url: "http://localhost:9000"
+  # addressing_style: "path"  # path, virtual, or auto
 
 # Parquet Settings
 parquet:
   compression: "snappy" # snappy, gzip, brotli, zstd
 
-  # Client-Side Encryption (Parquet Modular Encryption)
+  # Client-Side Encryption (optional - set enabled: true to use)
   encryption:
-    enabled: false # Set to true to enable
+    enabled: false
     # footer_key: "base64_encoded_master_key_32_bytes"
     # key_map:
     #   "key1": "base64_encoded_wrapping_key_1"
@@ -38,32 +43,55 @@ parquet:
 
 # Archive Job Settings
 archive:
-  # tables: List of tables to archive/backup
+  # Tables to archive - supports two formats:
+  # 1. Simple string (uses default primary key "id"):
+  #    - public.events
+  # 2. Dict with options (for custom primary keys):
+  #    - table: public.orders
+  #      primary_key: order_id
   tables:
-    - public.example_table
+    - public.events
+    - table: public.audit_logs
+      primary_key: log_id
 
   # mode: "offload" OR "backup"
-  # "offload": Moves old data to S3 (archive/table/...) and allows deletion.
-  # "backup": Creates a full snapshot (backups/timestamp/table/...), NO deletion allowed.
+  # "offload": Moves old data to S3 and optionally deletes from DB.
+  #            Retention checks DATA AGE.
+  # "backup":  Creates a full snapshot for Disaster Recovery.
+  #            Retention checks SNAPSHOT AGE. Delete not allowed.
   mode: "offload"
 
   # concurrency: Number of tables to process in parallel
-  concurrency: 1
+  concurrency: 2
 
-  # chunk_concurrency: Number of months to process in parallel WITHIN a table
+  # chunk_concurrency: Number of months to process in parallel per table
   chunk_concurrency: 4
 
-  # cutoff_exclusive:
-  #   For "offload": Data OLDER than this will be processed.
-  #   For "backup": Ignored (effectively 'now').
+  # cutoff_exclusive: (Offload mode only)
+  # Archive data OLDER than this date. Leave empty to process all data.
   cutoff_exclusive: "2025-01-01T00:00:00Z"
 
-  # Delete rows from DB after successful upload?
+  # base_dir: Local directory for parquet files and manifests
+  # Defaults to ./backparq-data if not specified
+  base_dir: "/data/backparq"
+
+  # perform_delete: Delete rows from DB after successful upload?
+  # WARNING: Data will be permanently removed from PostgreSQL!
   perform_delete: false
 
+  # delete_batch_size: Rows to delete per transaction (reduces lock time)
+  delete_batch_size: 10000
+
   # Safety flags
-  dry_run: true
-  overwrite: false
+  dry_run: true # Set to false to actually write/upload/delete
+  overwrite: false # Set to true to re-archive existing chunks
+
+  # Retention Policy (for prune command)
+  retention:
+    enabled: true
+    # For offload mode: delete archived data older than this
+    # For backup mode: delete snapshots older than this
+    months: 12 # Or use 'days: 30'
 
 # Cron Scheduling (Optional)
 cron:

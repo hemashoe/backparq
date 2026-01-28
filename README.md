@@ -1,118 +1,260 @@
-# Backparq: Postgres to S3 Parquet Archiver
+# Backparq
 
-**Backparq** is a robust data lifecycle tool that bridges the gap between your transactional database (Postgres) and your data lake (S3). It safely moves old data from active tables into compressed, queryable Parquet files on S3, and allows you to restore strictly defined chunks when needed.
+Archive PostgreSQL tables to Parquet files on S3 with safety, restore, and retention management.
 
-It is designed for high-volume production environments where deleting old data ("Pruning") is necessary for performance, but keeping that data accessible for auditing or analytics is required.
+[![Python 3.9+](https://img.shields.io/badge/python-3.9%2B-blue.svg)](https://www.python.org/)
+[![PyPI](https://img.shields.io/pypi/v/backparq.svg)](https://pypi.org/project/backparq/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-## Key Features
+## Features
 
--   **Archive & Offload**: Move cold data (e.g., older than 3 months) to S3 Parquet.
--   **Safety**: Checksums (SHA256) are verified after upload and *before* any data is deleted from DB.
--   **Restore**: Seamlessly copy data back from S3 to Postgres. Handles schema evolution (column drops) and complex types (JSON/Arrays) automatically.
--   **Maintenance**: Built-in `prune` command to manage retention of S3 backups.
--   **Performance**: Supports parallel processing of tables and *intra-table* chunks to maximize throughput.
--   **Observability**: CLI commands to `check` backup status and progress bars for long-running ops.
+- **Archive & Offload** - Move cold data to S3 Parquet, optionally delete from DB
+- **Backup Mode** - Full table snapshots for disaster recovery
+- **Safety First** - SHA256 checksums verified before any data deletion
+- **Schema Evolution** - Restore handles dropped columns automatically
+- **Parallel Processing** - Table-level and chunk-level concurrency
+- **Graceful Shutdown** - Clean interruption on SIGINT/SIGTERM
 
 ## Installation
 
 ```bash
-# Standard installation
 pip install backparq
+```
 
-# With dev dependencies (for testing)
-pip install "backparq[dev]"
+With optional features:
+
+```bash
+pip install backparq[all]      # All optional dependencies
+pip install backparq[query]    # DuckDB for querying archives
+pip install backparq[metrics]  # Prometheus metrics
+```
+
+## Quick Start
+
+```bash
+# Generate config interactively
+backparq init
+
+# Test connections
+backparq test --config backparq.yaml
+
+# Run archive (dry-run first)
+backparq archive --config backparq.yaml --dry-run -v
+
+# Run archive
+backparq archive --config backparq.yaml -v --stats
+```
+
+## Commands
+
+```text
+usage: backparq [-h] [-v] {test,archive,apply,restore,check,prune,status,verify,init} ...
+
+Commands:
+  test      Test connections
+  archive   Archive tables to Parquet/S3
+  apply     Archive and install cron
+  restore   Restore from archive
+  check     List S3 backups
+  prune     Delete old backups
+  status    Show archive status
+  verify    Verify archive integrity
+  init      Generate config file
+
+Options:
+  -v, --verbose   Verbosity (-v INFO, -vv DEBUG)
+```
+
+### archive
+
+```bash
+backparq archive --config config.yaml --stats
+backparq archive --config config.yaml --output json
+```
+
+### restore
+
+```bash
+backparq restore --config config.yaml --start 2024-01-01 --end 2024-04-01
+backparq restore --config config.yaml --start 2024-01-01 --end 2024-04-01 --conflict-mode upsert
+```
+
+### status
+
+```bash
+backparq status --config config.yaml
+backparq status --config config.yaml --table events --output json
+```
+
+### verify
+
+```bash
+backparq verify --config config.yaml
+backparq verify --config config.yaml --repair
 ```
 
 ## Configuration
 
-Backparq is purely config-driven. Create a `config.yaml` file:
+### Basic
 
 ```yaml
 database:
-  dsn: "postgresql://user:pass@localhost:5432/mydb"
+  host: localhost
+  port: 5432
+  name: mydb
+  user: postgres
+  password: "${PG_PASSWORD}"
 
 s3:
-  bucket: "my-company-data-lake"
-  prefix: "app_data"
-  region: "us-east-1"
+  bucket: my-backup-bucket
+  prefix: db-archive
+  region: us-east-1
 
 archive:
-  tables: ["public.events", "public.audit_logs"]
-  
-  # MODE: "offload" (Default) OR "backup"
-  # - offload: Moves OLD data to S3 (archive/...) and optionally deletes from DB.
-  #            Retention checks DATA AGE.
-  # - backup:  Creates FULL snapshot (backups/...) for Disaster Recovery.
-  #            Retention checks SNAPSHOT AGE.
-  mode: "offload" 
-  
-  concurrency: 2
-  chunk_concurrency: 4
-  
-  # [Offload Mode Only] Archive everything older than this date.
-  cutoff_exclusive: "2024-01-01T00:00:00Z"
-  
-  # [Offload Mode Only] DELETES rows from Postgres after upload.
-  perform_delete: false
+  mode: offload
+  tables:
+    - public.events
+    - public.orders
+```
 
-  # Retention Policy
-  # - In "offload" mode: Delete data older than 12 months.
-  # - In "backup" mode: Delete snapshots created older than 30 days.
+### Table Primary Keys
+
+```yaml
+archive:
+  tables:
+    - public.events                    # Uses default "id"
+    - table: public.orders
+      primary_key: order_id            # Custom primary key
+```
+
+The `primary_key` is used during `restore --conflict-mode upsert` to detect and update existing rows.
+
+### Full Example
+
+```yaml
+database:
+  host: localhost
+  port: 5432
+  name: production
+  user: backup_user
+  password: "${PG_PASSWORD}"
+  sslmode: require
+
+s3:
+  bucket: company-backups
+  prefix: postgres/archive
+  region: us-east-1
+  access_key_id: "${AWS_ACCESS_KEY_ID}"
+  secret_access_key: "${AWS_SECRET_ACCESS_KEY}"
+  sse: aws:kms
+  kms_key_id: alias/backup-key
+
+archive:
+  mode: offload
+  order_by: created_at
+  cutoff: -90d
+  perform_delete: false
+  concurrency: 2
+  base_dir: ./backparq-data
+
+  tables:
+    - public.events
+    - table: public.orders
+      primary_key: order_id
+
   retention:
     enabled: true
-    months: 12
-    days: 30
+    days: 365
+
+parquet:
+  compression: zstd
+  row_group_size: 100000
 ```
 
-See [config.example.yaml](config.example.yaml) for all options (including Encryption).
+## Archive Modes
 
-## Usage
+### Offload Mode (Default)
 
-### 1. Backup (Archive)
-Runs the archive process. Reads PG, converts to Parquet, uploads to S3.
-If `perform_delete: true` in config, it will also delete the source rows.
+Archives data older than `cutoff` date, partitioned by month.
+
+```yaml
+archive:
+  mode: offload
+  order_by: created_at
+  cutoff: -90d
+  perform_delete: true
+```
+
+### Backup Mode
+
+Creates full table snapshots with unique run ID.
+
+```yaml
+archive:
+  mode: backup
+```
+
+Restore from snapshot:
 
 ```bash
-backparq archive --config config.yaml
+backparq restore --config config.yaml --backup-id 2024-01-15_120000 --start 2024-01-01 --end 2024-02-01
 ```
 
-### 2. Check Backups
-List what is currently stored in S3, aggregated by table and month.
+## Testing
+
+### Local with MinIO
 
 ```bash
-backparq check --config config.yaml
+# Start MinIO
+docker run -d -p 9000:9000 -p 9001:9001 \
+  -e MINIO_ROOT_USER=minioadmin \
+  -e MINIO_ROOT_PASSWORD=minioadmin \
+  minio/minio server /data --console-address ":9001"
+
+# Create config
+cat > config.yaml << 'EOF'
+database:
+  host: localhost
+  port: 5432
+  name: testdb
+  user: postgres
+  password: postgres
+
+s3:
+  bucket: test-bucket
+  prefix: backparq
+  endpoint_url: http://localhost:9000
+  access_key_id: minioadmin
+  secret_access_key: minioadmin
+  addressing_style: path
+
+archive:
+  mode: offload
+  tables:
+    - public.test_table
+EOF
+
+# Test
+backparq test --config config.yaml
+backparq archive --config config.yaml -v --stats
 ```
 
-### 3. Restore (Rollback)
-Restore a specific date range of data back into Postgres.
-Supports `do_nothing` (skip existing) or `upsert` (override).
+## Development
 
 ```bash
-backparq restore \
-  --config config.yaml \
-  --start 2023-01-01 \
-  --end 2023-03-01 \
-  --conflict-mode do_nothing
+# Install dev dependencies
+pip install -e ".[dev]"
+
+# Run tests
+pytest
+
+# Type check
+mypy src/backparq
+
+# Lint
+ruff check src/
 ```
-
-### 4. Prune Retention
-Delete old S3 backups based on your `retention` policy in config.
-
-```bash
-# Dry run to see what would be deleted
-backparq prune --config config.yaml --dry-run
-
-# Execute delete
-backparq prune --config config.yaml
-```
-
-
-## How It Works
-
-1.  **Chunks**: Data is partitioned by Month (`YYYY-MM`).
-2.  **Streaming**: Data is streamed using server-side cursors to effectively use constant RAM regardless of table size.
-3.  **Atomic**: A Manifest file (`manifest.json`) is written to local disk (and S3) only after the Parquet file is successfully written and verified.
-4.  **Schema Evolution**: When restoring, Backparq fetches the *current* DB schema. If the Parquet file has columns that no longer exist in the DB, they are ignored.
 
 ## License
+
 MIT

@@ -1,98 +1,140 @@
-import datetime as dt
+"""Backup listing."""
+
+import json
+import logging
 from collections import defaultdict
-from typing import NamedTuple
+
+from rich.table import Table
 
 from backparq.config import BackparqConfig
+from backparq.console import (
+    console,
+    format_count,
+    format_size,
+    print_header,
+    print_success,
+    print_warning,
+)
 from backparq.s3 import s3_client_from_config
-from backparq.parquet import load_manifest
-from backparq.archive import s3_key_for_chunk
-from backparq.db import ChunkSpec
 
-class BackupStat(NamedTuple):
-    table: str
-    year: int
-    month: int
-    rows: int
-    size_bytes: int
-    key: str
-    verified: bool
+logger = logging.getLogger(__name__)
 
-def check_backups(config: BackparqConfig, prefix_filter: str = "") -> None:
-    """
-    List backups in S3 and print summary.
-    """
+
+def check_backups(config: BackparqConfig, output_json: bool = False) -> dict:
+    result = {"backups": [], "summary": {}}
+
     if not config.s3.bucket:
-        print("No S3 bucket configured.")
-        return
+        print_warning("No S3 bucket configured")
+        return result
+
+    if not output_json:
+        print_header("BACKPARQ CHECK")
+        console.print(f"Bucket: s3://{config.s3.bucket}/{config.s3.prefix}")
+        console.print()
 
     s3 = s3_client_from_config(config.s3)
-    bucket = config.s3.bucket
-    prefix = config.s3.prefix
-    if prefix_filter:
-        prefix = f"{prefix}/{prefix_filter}".replace("//", "/")
-    
-    print(f"Checking backups in s3://{bucket}/{prefix} ...")
-
+    prefix = f"{config.s3.prefix}/"
     paginator = s3.get_paginator("list_objects_v2")
-    
-    stats_by_table = defaultdict(list)
+
+    backups = []
     total_size = 0
-    total_rows = 0
-    
-    # We scan S3 objects.
-    # Structure: prefix/table/year=YYYY/month=MM/name.parquet
-    # We look for .parquet files.
-    
-    for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+
+    for page in paginator.paginate(Bucket=config.s3.bucket, Prefix=prefix):
         for obj in page.get("Contents", []):
             key = obj["Key"]
             if not key.endswith(".parquet"):
                 continue
-                
+
             size = obj["Size"]
             total_size += size
-            
-            # Parse key to get metadata?
-            # Or read object metadata (head_object) for 'sha256'?
-            # Doing HeadObject on every file is slow. 
-            # We trust the listing for existence.
-            
-            parts = key.split("/")
-            # Attempt to extract table, year, month
-            # Format: .../table/year=YYYY/month=MM/file.parquet
-            if len(parts) >= 4:
-                try:
-                    # simplistic parsing
-                    table = parts[-4]
-                    year_str = parts[-3]
-                    month_str = parts[-2]
-                    
-                    year = int(year_str.split("=")[1]) if "=" in year_str else 0
-                    month = int(month_str.split("=")[1]) if "=" in month_str else 0
-                    
-                    stats_by_table[table].append(BackupStat(
-                        table=table,
-                        year=year,
-                        month=month,
-                        rows=-1, # Unknown without manifest or footer
-                        size_bytes=size,
-                        key=key,
-                        verified=True # Exists
-                    ))
-                except Exception:
-                    # Ignore weird files
-                    pass
 
-    print(f"\nFound {sum(len(l) for l in stats_by_table.values())} backup files.")
-    print(f"Total Size: {total_size / (1024*1024):.2f} MB\n")
-    
-    for table, stats in stats_by_table.items():
-        table_size = sum(s.size_bytes for s in stats)
-        min_date = min((s.year, s.month) for s in stats) if stats else ("-", "-")
-        max_date = max((s.year, s.month) for s in stats) if stats else ("-", "-")
-        
-        print(f"Table: {table}")
-        print(f"  Files: {len(stats)}")
-        print(f"  Size:  {table_size / (1024*1024):.2f} MB")
-        print(f"  Range: {min_date[0]}-{min_date[1]:02} to {max_date[0]}-{max_date[1]:02}")
-        print("")
+            info = _parse_backup_key(key, config.s3.prefix)
+            info["size"] = size
+            info["last_modified"] = obj["LastModified"].isoformat()
+
+            try:
+                head = s3.head_object(Bucket=config.s3.bucket, Key=key)
+                meta = head.get("Metadata", {})
+                info["rows"] = int(meta.get("rows", 0))
+                info["verified"] = bool(meta.get("sha256"))
+            except Exception:
+                info["rows"] = 0
+                info["verified"] = False
+
+            backups.append(info)
+
+    if not backups:
+        print_warning("No backups found")
+        return result
+
+    by_table = defaultdict(list)
+    for b in backups:
+        by_table[b.get("table", "unknown")].append(b)
+
+    result["backups"] = backups
+    result["summary"] = {
+        "total_files": len(backups),
+        "total_size": total_size,
+        "tables": len(by_table),
+    }
+
+    if output_json:
+        print(json.dumps(result, indent=2, default=str))
+        return result
+
+    table = Table(show_header=True, header_style="bold")
+    table.add_column("Table")
+    table.add_column("Files", justify="right")
+    table.add_column("Rows", justify="right")
+    table.add_column("Size", justify="right")
+    table.add_column("Verified")
+
+    for tbl, items in sorted(by_table.items()):
+        total_rows = sum(i.get("rows", 0) for i in items)
+        total_sz = sum(i["size"] for i in items)
+        verified = all(i.get("verified") for i in items)
+        table.add_row(
+            tbl,
+            str(len(items)),
+            format_count(total_rows),
+            format_size(total_sz),
+            "[green]Yes[/green]" if verified else "[yellow]No[/yellow]",
+        )
+
+    console.print(table)
+    console.print()
+    print_success(
+        f"Found {len(backups)} files ({format_size(total_size)}) across {len(by_table)} tables"
+    )
+
+    return result
+
+
+def _parse_backup_key(key: str, prefix: str) -> dict:
+    info = {"key": key, "table": None, "year": None, "month": None, "mode": None}
+    path = key[len(prefix) :].lstrip("/")
+    parts = path.split("/")
+
+    if "backups" in parts:
+        info["mode"] = "backup"
+    elif "archive" in parts:
+        info["mode"] = "offload"
+
+    for p in parts:
+        if p.startswith("year="):
+            try:
+                info["year"] = int(p.split("=")[1])
+            except (ValueError, IndexError):
+                pass
+        elif p.startswith("month="):
+            try:
+                info["month"] = int(p.split("=")[1])
+            except (ValueError, IndexError):
+                pass
+
+    filename = parts[-1] if parts else ""
+    if filename.endswith(".parquet"):
+        name = filename.rsplit("_", 1)[0]
+        info["table"] = name.replace("_", ".", 1) if "_" in name else name
+
+    return info
