@@ -1,156 +1,119 @@
+"""Retention management and pruning."""
+
 import datetime as dt
-from collections import defaultdict
-from typing import NamedTuple
+import logging
+
+from rich.table import Table
 
 from backparq.config import BackparqConfig
+from backparq.console import (
+    console,
+    create_progress,
+    format_size,
+    print_header,
+    print_success,
+    print_warning,
+)
 from backparq.s3 import s3_client_from_config
-from backparq.db import add_months, month_floor
 
-def prune_backups(config: BackparqConfig, dry_run: bool = False) -> None:
+logger = logging.getLogger(__name__)
+
+
+def prune_backups(config: BackparqConfig, dry_run: bool = False) -> dict:
+    result = {"deleted": [], "summary": {"files_deleted": 0, "bytes_freed": 0}}
+
     if not config.archive.retention.enabled:
-        print("Retention policy is disabled in config.")
-        return
+        print_warning("Retention disabled")
+        return result
 
     if not config.s3.bucket:
-        print("No S3 bucket configured.")
-        return
+        print_warning("No S3 bucket configured")
+        return result
+
+    print_header("BACKPARQ PRUNE")
+    console.print(f"Retention: {config.archive.retention.days} days")
+    console.print(f"Dry Run: {'yes' if dry_run else 'no'}")
+    console.print()
 
     s3 = s3_client_from_config(config.s3)
-    bucket = config.s3.bucket
-    prefix = config.s3.prefix
-    
+    prefix = f"{config.s3.prefix}/"
+    cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=config.archive.retention.days)
+
+    console.print(f"Cutoff: {cutoff.strftime('%Y-%m-%d')}")
+    console.print()
+
     to_delete = []
+    paginator = s3.get_paginator("list_objects_v2")
 
-    if config.archive.mode == "backup":
-        # Mode: Backup (Snapshots)
-        # Strategy: Keep latest N snapshots (days/months roughly maps to counts or time matching?)
-        # User request: "retent on created time of backup last 12 or whatever"
-        # Since we use daily/scheduled runs, let's assume 'days' = keep last N runs? 
-        # Or time-based? "older than X days" is better.
-        
-        days = config.archive.retention.days
-        months = config.archive.retention.months
-        
-        # Determine cutoff time
-        # Any backup created BEFORE this time is deleted.
-        now = dt.datetime.now(dt.timezone.utc)
-        cutoff_date = now
-        
-        if days > 0:
-            cutoff_date = now - dt.timedelta(days=days)
-            print(f"Pruning BACKUPS created older than {days} days (Before: {cutoff_date})")
-        elif months > 0:
-            cutoff_date = now - dt.timedelta(days=months * 30) # approx
-            print(f"Pruning BACKUPS created older than {months} months (Before: {cutoff_date})")
-        else:
-             print("Retention enabled but no days/months set.")
-             return
-
-        # List "backups/" folder
-        # Prefix: {prefix}/backups/{RUN_ID}/...
-        # RUN_ID is "YYYY-MM-DD_HHMMSS"
-        
-        backup_root = f"{prefix}/backups/"
-        print(f"Scanning {backup_root}...")
-        
-        paginator = s3.get_paginator("list_objects_v2")
-        result = s3.list_objects_v2(Bucket=bucket, Prefix=backup_root, Delimiter="/")
-        
-        # 'CommonPrefixes' contains the run folders
-        runs = []
-        for p in result.get("CommonPrefixes", []):
-            # p['Prefix'] = "prefix/backups/2025-01-01_120000/"
-            folder = p["Prefix"]
-            run_id = folder.rstrip("/").split("/")[-1]
-            try:
-                run_time = dt.datetime.strptime(run_id, "%Y-%m-%d_%H%M%S").replace(tzinfo=dt.timezone.utc)
-                runs.append((run_time, folder))
-            except ValueError:
+    for page in paginator.paginate(Bucket=config.s3.bucket, Prefix=prefix):
+        for obj in page.get("Contents", []):
+            key = obj["Key"]
+            if not key.endswith(".parquet"):
                 continue
 
-        for run_time, folder in runs:
-            if run_time < cutoff_date:
-                # Delete this entire folder
-                # We need to list all objects recursively under this folder
-                print(f"Marking obsolete backup: {run_id} (Date: {run_time})")
-                
-                # Recursively list objects to delete
-                for page in paginator.paginate(Bucket=bucket, Prefix=folder):
-                    for obj in page.get("Contents", []):
-                        to_delete.append({"Key": obj["Key"]})
-
-    else:
-        # Mode: Offload (Archive)
-        # Strategy: Data Age (Chunk Date)
-        # Existing logic
-        days = config.archive.retention.days
-        months = config.archive.retention.months
-        
-        now = dt.datetime.now(dt.timezone.utc)
-        cutoff_date = now
-        
-        if days > 0:
-            cutoff_date = now - dt.timedelta(days=days)
-            print(f"Pruning ARCHIVED DATA older than {days} days (Data Date < {cutoff_date.date()})")
-        elif months > 0:
-            year = now.year - (months // 12)
-            month = now.month - (months % 12)
-            if month <= 0:
-                month += 12
-                year -= 1
-            cutoff_date = dt.datetime(year, month, 1, tzinfo=dt.timezone.utc)
-            print(f"Pruning ARCHIVED DATA older than {months} months (Data Date < {year}-{month:02})")
-
-        print(f"Scanning s3://{bucket}/{prefix}/archive/ ...")
-        paginator = s3.get_paginator("list_objects_v2")
-        
-        # Scan archive folder
-        archive_root = f"{prefix}/archive/"
-        
-        for page in paginator.paginate(Bucket=bucket, Prefix=archive_root):
-            for obj in page.get("Contents", []):
-                key = obj["Key"]
-                # Parse: .../year=YYYY/month=MM/...
-                parts = key.split("/")
-                year = 0
-                month = 0
-                for p in parts:
-                    if p.startswith("year="):
-                         try: year = int(p.split("=")[1])
-                         except: pass
-                    if p.startswith("month="):
-                         try: month = int(p.split("=")[1])
-                         except: pass
-                
-                if year > 0 and month > 0:
-                    chunk_date = dt.datetime(year, month, 1, tzinfo=dt.timezone.utc)
-                    if chunk_date < cutoff_date:
-                        to_delete.append({"Key": key})
+            year, month = _parse_year_month(key)
+            if year and month:
+                file_date = dt.datetime(year, month, 1, tzinfo=dt.timezone.utc)
+                if file_date < cutoff:
+                    to_delete.append({"key": key, "size": obj["Size"], "date": file_date})
 
     if not to_delete:
-        print("No files to prune.")
-        return
+        print_success("No files to prune")
+        return result
 
-    print(f"Found {len(to_delete)} files to prune.")
-    
+    table = Table(show_header=True, header_style="bold")
+    table.add_column("File")
+    table.add_column("Date")
+    table.add_column("Size", justify="right")
+
+    for item in to_delete[:20]:
+        table.add_row(
+            item["key"].split("/")[-1], item["date"].strftime("%Y-%m"), format_size(item["size"])
+        )
+
+    if len(to_delete) > 20:
+        table.add_row("...", f"+{len(to_delete) - 20} more", "")
+
+    console.print(table)
+    console.print()
+
+    total_size = sum(i["size"] for i in to_delete)
+    console.print(f"Files to delete: {len(to_delete)} ({format_size(total_size)})")
+    console.print()
+
     if dry_run:
-        print("DRY RUN: Files that would be deleted:")
-        for d in to_delete[:5]:
-            print(f" - {d['Key']}")
-        if len(to_delete) > 5: print(" ... and more")
-        return
+        print_warning("DRY RUN: No files deleted")
+        return result
 
-    # Delete in batches
-    batch_size = 1000
-    deleted_count = 0
-    from tqdm import tqdm
-    
-    for i in tqdm(range(0, len(to_delete), batch_size), desc="Pruning"):
-        batch = to_delete[i:i+batch_size]
-        try:
-            s3.delete_objects(Bucket=bucket, Delete={"Objects": batch})
-            deleted_count += len(batch)
-        except Exception as e:
-            print(f"Error deleting batch: {e}")
-            
-    print(f"Successfully pruned {deleted_count} files.")
+    with create_progress() as progress:
+        task = progress.add_task("Deleting", total=len(to_delete))
+        for item in to_delete:
+            try:
+                s3.delete_object(Bucket=config.s3.bucket, Key=item["key"])
+                result["deleted"].append(item["key"])
+                result["summary"]["files_deleted"] += 1
+                result["summary"]["bytes_freed"] += item["size"]
+            except Exception as e:
+                logger.error(f"Delete failed {item['key']}: {e}")
+            progress.advance(task)
+
+    print_success(
+        f"Deleted {result['summary']['files_deleted']} files ({format_size(result['summary']['bytes_freed'])})"
+    )
+    return result
+
+
+def _parse_year_month(key: str) -> tuple[int, int]:
+    year = month = 0
+    for p in key.split("/"):
+        if p.startswith("year="):
+            try:
+                year = int(p.split("=")[1])
+            except (ValueError, IndexError):
+                pass
+        if p.startswith("month="):
+            try:
+                month = int(p.split("=")[1])
+            except (ValueError, IndexError):
+                pass
+    return year, month
