@@ -6,6 +6,8 @@ __pycache__/
 # C extensions
 *.so
 
+docker/
+
 # Distribution / packaging
 .Python
 build/
@@ -71,13 +73,20 @@ venv.bak/
 # macOS
 .DS_Store
 
+# Examples
+
+DEPLOY.md
+# Data
+backparq-data/
+backparq-data-backup/
+backparq-data-offload/
+
 # Project specific
 config.yaml
 config.local.yaml
 *.parquet
 *.manifest.json
 *.sha256
-backparq-data/
 
 # Secrets - never commit these!
 *.pem

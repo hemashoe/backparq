@@ -1,5 +1,7 @@
 """Archive PostgreSQL tables to Parquet files with S3 upload."""
 
+from __future__ import annotations
+
 import datetime as dt
 import json
 import logging
@@ -9,9 +11,10 @@ import threading
 import time
 from pathlib import Path
 from typing import Optional
+import concurrent.futures
 
 from backparq.config import BackparqConfig
-from backparq.console import (
+from backparq.utils.console import (
     console,
     create_progress,
     format_count,
@@ -26,46 +29,25 @@ from backparq.console import (
 from backparq.db import (
     ChunkSpec,
     connect_pg,
-    delete_chunk_safely,
+    delete_chunk_with_verification,
     export_chunk_to_parquet_streaming,
     list_chunks,
     pg_count_rows,
+    vacuum_table,
     validate_tables_exist,
 )
 from backparq.models import ArchiveResult, RunProgress, TableProgress
-from backparq.parquet import (
-    build_encryption_properties,
-    load_manifest,
-    safe_mkdir,
-    sha256_file,
-    validate_parquet_file,
-    write_manifest,
-    write_text,
-)
-from backparq.s3 import s3_client_from_config, s3_upload_file, s3_verify_object_sha256
-
-logger = logging.getLogger(__name__)
-
-_shutdown_requested = threading.Event()
 _result_lock = threading.Lock()
 _current_result = ArchiveResult()
 
 
-def request_shutdown():
-    _shutdown_requested.set()
+from backparq.storage.s3 import create_client as s3_client_from_config, upload_file as s3_upload_file, verify_checksum as s3_verify_object_sha256
+from backparq.utils.logging import get_correlation_id, set_correlation_id, log_with_data
+from backparq.utils.lock import Lock as BackparqLock, LockError
+
+logger = logging.getLogger(__name__)
 
 
-def is_shutdown_requested() -> bool:
-    return _shutdown_requested.is_set()
-
-
-def _setup_signal_handlers():
-    def handler(sig, frame):
-        logger.warning(f"Received signal {sig}, initiating graceful shutdown...")
-        request_shutdown()
-
-    signal.signal(signal.SIGINT, handler)
-    signal.signal(signal.SIGTERM, handler)
 
 
 def _update_result(chunks=0, rows=0, bytes_up=0, error=None):
@@ -124,24 +106,22 @@ def _s3_extra_args(config) -> dict:
 def _process_chunk(
     chunk: ChunkSpec,
     config: BackparqConfig,
+    pool,
     s3,
     do_upload: bool,
     extra_args: dict,
     encryption_properties,
     run_id: Optional[str] = None,
+    shutdown_event: Optional[threading.Event] = None,
 ) -> dict:
     """Process a single chunk. Returns stats dict."""
-    if is_shutdown_requested():
+    if shutdown_event and shutdown_event.is_set():
         return {"rows": 0, "bytes": 0}
 
-    conn = connect_pg(config.database)
-    try:
+    with pool.connection() as conn:
         return _process_chunk_impl(
             chunk, config, conn, s3, do_upload, extra_args, encryption_properties, run_id
         )
-    finally:
-        conn.close()
-
 
 def _process_chunk_impl(
     chunk: ChunkSpec,
@@ -163,14 +143,16 @@ def _process_chunk_impl(
 
     if config.archive.dry_run:
         db_rows = pg_count_rows(conn, chunk.table, chunk.start, chunk.end, config.archive.order_by)
-        logger.info(f"DRY RUN: Would archive {db_rows} rows from {chunk}")
+        log_with_data(logger, logging.INFO, f"DRY RUN: Would archive chunk {chunk}", 
+                      table=chunk.table, rows=db_rows, start=str(chunk.start), end=str(chunk.end))
         return stats
 
     db_rows = pg_count_rows(conn, chunk.table, chunk.start, chunk.end, config.archive.order_by)
     if db_rows == 0:
         return stats
 
-    logger.debug(f"Chunk {chunk}: {db_rows} rows")
+    log_with_data(logger, logging.DEBUG, f"Processing chunk", 
+                  table=chunk.table, rows=db_rows, start=str(chunk.start), end=str(chunk.end))
 
     # Check existing manifest
     existing = load_manifest(manifest_path)
@@ -182,7 +164,7 @@ def _process_chunk_impl(
 
         if final_parquet.exists() and expected is not None:
             try:
-                parquet_rows = validate_parquet_file(final_parquet, int(expected))
+                parquet_rows = validate_file(final_parquet, int(expected))
                 already_done = parquet_rows == expected == db_rows
             except Exception:
                 already_done = False
@@ -211,11 +193,13 @@ def _process_chunk_impl(
             chunk.table,
             chunk.start,
             chunk.end,
-            config.archive.order_by,
             inprogress_parquet,
+            config.archive.order_by,
+            config.archive.fetch_size,
             config.parquet.row_group_size,
             config.parquet.compression,
             encryption_properties,
+            masking=config.archive.get_table_config(chunk.table).masking,
         )
 
         if row_count == 0:
@@ -224,25 +208,32 @@ def _process_chunk_impl(
             return stats
 
         inprogress_parquet.rename(final_parquet)
-        sha = sha256_file(final_parquet)
-        write_text(sha_path, sha)
+        sha = compute_sha256(final_parquet)
+        sha_path.write_text(sha)
         stats["rows"] = row_count
         stats["bytes"] = final_parquet.stat().st_size
     else:
-        sha = existing.get("sha256", sha256_file(final_parquet))
+        sha = existing.get("sha256", compute_sha256(final_parquet))
         stats["bytes"] = final_parquet.stat().st_size if final_parquet.exists() else 0
 
     # Upload
     uploaded = False
     if do_upload and s3:
         if not s3_verify_object_sha256(s3, config.s3.bucket, s3_key, sha):
-            metadata = {
-                "sha256": sha,
-                "rows": str(stats["rows"] or existing.get("exported_rows", 0)),
-            }
-            s3_upload_file(s3, str(final_parquet), config.s3.bucket, s3_key, extra_args, metadata)
+            upload_start = time.time()
+            s3_upload_file(
+                s3,
+                final_parquet,
+                config.s3.bucket,
+                s3_key,
+                sha,
+                extra_args,
+                metadata={"rows": stats["rows"]},
+            )
+            upload_duration = time.time() - upload_start
             uploaded = True
-            logger.debug(f"Uploaded: {s3_key}")
+            log_with_data(logger, logging.DEBUG, f"Uploaded chunk to S3",
+                          s3_key=s3_key, size_bytes=stats["bytes"], duration_seconds=round(upload_duration, 2))
         else:
             uploaded = True
 
@@ -261,7 +252,7 @@ def _process_chunk_impl(
 
     # Delete
     if config.archive.perform_delete and uploaded:
-        if delete_chunk_safely(
+        if delete_chunk_with_verification(
             conn,
             chunk.table,
             sha,
@@ -281,52 +272,93 @@ def _process_chunk_impl(
 def _process_table(
     table: str,
     config: BackparqConfig,
+    pool,
     s3,
     extra_args: dict,
     run_id: Optional[str],
     progress,
     task_id,
+    shutdown_event: threading.Event,
 ) -> dict:
     """Process all chunks for a table."""
     table_stats = {"chunks": 0, "rows": 0, "bytes": 0}
 
-    if is_shutdown_requested():
+    if shutdown_event.is_set():
         return table_stats
 
-    conn = connect_pg(config.database)
-    try:
+    # List chunks using pool connection
+    with pool.connection() as conn:
         cutoff = config.archive.cutoff_exclusive
         if config.archive.mode == "backup" or cutoff is None:
             cutoff = dt.datetime.now(dt.timezone.utc) + dt.timedelta(days=1)
-
+        
         chunks = list_chunks(conn, table, cutoff, config.archive.order_by)
-    finally:
-        conn.close()
 
     if not chunks:
         logger.debug(f"No data for {table}")
         return table_stats
 
-    encryption_properties = build_encryption_properties(config.parquet)
+    encryption_properties = build_encryption(config.parquet)
     do_upload = bool(config.s3.bucket)
 
-    for chunk in chunks:
-        if is_shutdown_requested():
-            break
+    max_workers = config.archive.chunk_concurrency
+    
+    if max_workers > 1:
+        logger.info(f"Processing {table} with {max_workers} threads")
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {}
+            for chunk in chunks:
+                if shutdown_event.is_set():
+                    break
+                
+                future = executor.submit(
+                    _process_chunk,
+                    chunk, config, pool, s3, do_upload, extra_args, encryption_properties, run_id, shutdown_event
+                )
+                futures[future] = chunk
 
+            for future in concurrent.futures.as_completed(futures):
+                chunk = futures[future]
+                try:
+                    stats = future.result()
+                    table_stats["chunks"] += 1
+                    table_stats["rows"] += stats["rows"]
+                    table_stats["bytes"] += stats["bytes"]
+                    _update_result(chunks=1, rows=stats["rows"], bytes_up=stats["bytes"])
+                except Exception as e:
+                    logger.error(f"Chunk error {chunk}: {e}")
+                    _update_result(error=str(e))
+                
+                progress.advance(task_id)
+    else:
+        # Sequential processing
+        for chunk in chunks:
+            if shutdown_event.is_set():
+                break
+
+            try:
+                stats = _process_chunk(
+                    chunk, config, pool, s3, do_upload, extra_args, encryption_properties, run_id, shutdown_event
+                )
+                table_stats["chunks"] += 1
+                table_stats["rows"] += stats["rows"]
+                table_stats["bytes"] += stats["bytes"]
+                _update_result(chunks=1, rows=stats["rows"], bytes_up=stats["bytes"])
+            except Exception as e:
+                logger.error(f"Chunk error {chunk}: {e}")
+                _update_result(error=str(e))
+
+            progress.advance(task_id)
+
+    
+    # Run VACUUM if configured and we are not shutting down
+    # We only vacuum if we are in offload mode (perform_delete=True) or explicit vacuum request
+    if config.archive.vacuum and not shutdown_event.is_set():
         try:
-            stats = _process_chunk(
-                chunk, config, s3, do_upload, extra_args, encryption_properties, run_id
-            )
-            table_stats["chunks"] += 1
-            table_stats["rows"] += stats["rows"]
-            table_stats["bytes"] += stats["bytes"]
-            _update_result(chunks=1, rows=stats["rows"], bytes_up=stats["bytes"])
+            with pool.autocommit_connection() as conn:
+                vacuum_table(conn, table)
         except Exception as e:
-            logger.error(f"Chunk error {chunk}: {e}")
-            _update_result(error=str(e))
-
-        progress.advance(task_id)
+            logger.error(f"Vacuum failed for {table}: {e}")
 
     return table_stats
 
@@ -337,13 +369,27 @@ def _write_progress(path: Path, run_progress: RunProgress):
         json.dump(run_progress.to_dict(), f, indent=2)
 
 
-def archive_tables(config: BackparqConfig, show_stats: bool = False) -> ArchiveResult:
+from backparq.storage.parquet import (
+    build_encryption,
+    load_manifest,
+    safe_mkdir,
+    compute_sha256,
+    validate_file,
+    write_manifest,
+)
+
+def archive_tables(
+    config: BackparqConfig,
+    show_stats: bool = False,
+    shutdown_event: Optional[threading.Event] = None
+) -> ArchiveResult:
     """Archive all configured tables."""
     global _current_result
     _current_result = ArchiveResult()
     start_time = time.time()
-
-    _setup_signal_handlers()
+    
+    # Use provided event or create a local one (that won't be triggered by signals unless passed in)
+    shutdown = shutdown_event or threading.Event()
 
     print_header("BACKPARQ ARCHIVE")
     console.print(f"Mode: [bold]{config.archive.mode}[/bold]")
@@ -357,6 +403,38 @@ def archive_tables(config: BackparqConfig, show_stats: bool = False) -> ArchiveR
     if config.archive.dry_run:
         print_warning("DRY RUN: No data will be modified")
     console.print()
+
+    # Acquire lock to prevent concurrent runs
+    lock = None
+    if not config.archive.dry_run:
+        try:
+            lock = BackparqLock(config.archive.base_dir)
+            lock.acquire()
+            console.print("[dim]Lock acquired[/dim]")
+        except LockError as e:
+            print_error(str(e))
+            _current_result.errors.append(str(e))
+            return _current_result
+
+    try:
+        return _archive_tables_impl(config, show_stats, start_time, lock, shutdown)
+    finally:
+        if lock:
+            lock.release()
+
+
+def _archive_tables_impl(
+    config: BackparqConfig,
+    show_stats: bool,
+    start_time: float,
+    lock: Optional[BackparqLock] = None,
+    shutdown_event: Optional[threading.Event] = None,
+) -> ArchiveResult:
+    """Internal implementation of archive_tables (runs while holding lock)."""
+    global _current_result
+    
+    # Use provided event or fallback to global for backward compatibility with tests
+    shutdown = shutdown_event or _shutdown_requested
 
     s3 = None
     extra_args = _s3_extra_args(config.s3)
@@ -395,54 +473,60 @@ def archive_tables(config: BackparqConfig, show_stats: bool = False) -> ArchiveR
         started_at=dt.datetime.now(dt.timezone.utc),
     )
 
-    # Count total chunks
-    total_chunks = 0
-    table_chunks = {}
+    # Initialize connection pool
+    from backparq.db.connection import ConnectionPool
+    # Set max connections based on concurrency + extra
+    pool_size = max(2, config.archive.chunk_concurrency + 2)
+    
+    with ConnectionPool(config.database, minconn=2, maxconn=pool_size) as pool:
+        # Count total chunks
+        total_chunks = 0
+        table_chunks = {}
 
-    conn = connect_pg(config.database)
-    try:
-        for table in table_names:
-            cutoff = config.archive.cutoff_exclusive or dt.datetime.now(
-                dt.timezone.utc
-            ) + dt.timedelta(days=1)
-            chunks = list_chunks(conn, table, cutoff, config.archive.order_by)
-            table_chunks[table] = len(chunks)
-            total_chunks += len(chunks)
-            run_progress.tables[table] = TableProgress(status="pending", chunks_total=len(chunks))
-    finally:
-        conn.close()
+        with pool.connection() as conn:
+            for table in table_names:
+                cutoff = config.archive.cutoff_exclusive or dt.datetime.now(
+                    dt.timezone.utc
+                ) + dt.timedelta(days=1)
+                chunks = list_chunks(conn, table, cutoff, config.archive.order_by)
+                table_chunks[table] = len(chunks)
+                total_chunks += len(chunks)
+                run_progress.tables[table] = TableProgress(status="pending", chunks_total=len(chunks))
 
-    if total_chunks == 0:
-        print_warning("No data to archive")
-        return _current_result
+        if total_chunks == 0:
+            print_warning("No data to archive")
+            return _current_result
 
-    console.print(f"Found [bold]{total_chunks}[/bold] chunks across {len(table_names)} tables\n")
+        console.print(f"Found [bold]{total_chunks}[/bold] chunks across {len(table_names)} tables\n")
 
-    # Process with progress bar
-    with create_progress() as progress:
-        main_task = progress.add_task("Archiving", total=total_chunks)
+        # Process with progress bar
+        with create_progress() as progress:
+            main_task = progress.add_task("Archiving", total=total_chunks)
 
-        for table in table_names:
-            if is_shutdown_requested():
-                break
+            for table in table_names:
+                if shutdown.is_set():
+                    break
 
-            run_progress.tables[table].status = "in_progress"
-            _write_progress(progress_file, run_progress)
+                run_progress.tables[table].status = "in_progress"
+                _write_progress(progress_file, run_progress)
 
-            try:
-                stats = _process_table(table, config, s3, extra_args, run_id, progress, main_task)
-                run_progress.tables[table].status = "completed"
-                run_progress.tables[table].chunks_complete = stats["chunks"]
-                run_progress.tables[table].rows_archived = stats["rows"]
-                _current_result.tables_processed += 1
+                try:
+                    stats = _process_table(
+                        table, config, pool, s3, extra_args, run_id, progress, main_task, shutdown
+                    )
+                    run_progress.tables[table].status = "completed"
+                    run_progress.tables[table].chunks_complete = stats["chunks"]
+                    run_progress.tables[table].rows_archived = stats["rows"]
+                    _current_result.tables_processed += 1
 
-                logger.info(
-                    f"Completed {table}: {stats['chunks']} chunks, {format_count(stats['rows'])} rows"
-                )
-            except Exception as e:
-                run_progress.tables[table].status = "failed"
-                _current_result.errors.append(f"{table}: {e}")
-                logger.error(f"Table {table} failed: {e}")
+                    log_with_data(logger, logging.INFO, f"Completed table archive",
+                                  table=table, chunks=stats["chunks"], rows=stats["rows"], bytes=stats["bytes"])
+                except Exception as e:
+                    run_progress.tables[table].status = "failed"
+                    _current_result.errors.append(f"{table}: {e}")
+                    logger.error(f"Table {table} failed: {e}")
+
+    _write_progress(progress_file, run_progress)
 
     _write_progress(progress_file, run_progress)
 
@@ -468,7 +552,7 @@ def archive_tables(config: BackparqConfig, show_stats: bool = False) -> ArchiveR
             }
         )
 
-    if is_shutdown_requested():
+    if shutdown.is_set():
         print_warning("Archive interrupted")
         sys.exit(130)
 

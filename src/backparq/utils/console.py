@@ -1,4 +1,6 @@
-"""Console utilities for backparq."""
+"""Console output utilities."""
+
+from __future__ import annotations
 
 from typing import Any
 
@@ -55,7 +57,7 @@ def print_info(msg: str) -> None:
     console.print(f"[blue]INFO[/blue] {msg}")
 
 
-def print_table(title: str, columns: list[str], rows: list[list[Any]]) -> None:
+def print_table(title: str, columns: list, rows: list) -> None:
     table = Table(title=title, show_header=True, header_style="bold")
     for col in columns:
         table.add_column(col)
@@ -64,7 +66,7 @@ def print_table(title: str, columns: list[str], rows: list[list[Any]]) -> None:
     console.print(table)
 
 
-def print_stats(stats: dict[str, Any]) -> None:
+def print_stats(stats: dict) -> None:
     table = Table(title="Statistics", show_header=False, box=None)
     table.add_column("Metric", style="cyan")
     table.add_column("Value", style="green")

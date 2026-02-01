@@ -2,7 +2,7 @@
 
 
 
-from backparq.console import format_count, format_size
+from backparq.utils.console import format_count, format_size
 from backparq.status import _get_local_stats
 
 

@@ -1,12 +1,14 @@
 """Retention management and pruning."""
 
+from __future__ import annotations
+
 import datetime as dt
 import logging
 
 from rich.table import Table
 
 from backparq.config import BackparqConfig
-from backparq.console import (
+from backparq.utils.console import (
     console,
     create_progress,
     format_size,
@@ -14,7 +16,7 @@ from backparq.console import (
     print_success,
     print_warning,
 )
-from backparq.s3 import s3_client_from_config
+from backparq.storage.s3 import create_client as s3_client_from_config
 
 logger = logging.getLogger(__name__)
 
@@ -31,13 +33,14 @@ def prune_backups(config: BackparqConfig, dry_run: bool = False) -> dict:
         return result
 
     print_header("BACKPARQ PRUNE")
-    console.print(f"Retention: {config.archive.retention.days} days")
+    retention_days = config.archive.retention.total_days
+    console.print(f"Retention: {retention_days} days")
     console.print(f"Dry Run: {'yes' if dry_run else 'no'}")
     console.print()
 
     s3 = s3_client_from_config(config.s3)
     prefix = f"{config.s3.prefix}/"
-    cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=config.archive.retention.days)
+    cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=retention_days)
 
     console.print(f"Cutoff: {cutoff.strftime('%Y-%m-%d')}")
     console.print()

@@ -1,0 +1,34 @@
+database:
+  host: localhost
+  port: 5432
+  name: source_db
+  user: postgres
+  password: password
+
+s3:
+  bucket: test-bucket
+  prefix: archive_test
+  endpoint_url: http://localhost:9000
+  access_key_id: minioadmin
+  secret_access_key: minioadmin
+  region: us-east-1
+
+parquet:
+  row_group_size: 100000
+  compression: zstd
+
+archive:
+  mode: offload
+  vacuum: true
+  chunk_concurrency: 4
+  base_dir: ./backparq-data-offload
+  tables:
+    - table: public.events
+      primary_key: id
+    - table: public.users
+      primary_key: id
+      masking:
+        username: redact
+        email: hash
+  retention:
+    enabled: false

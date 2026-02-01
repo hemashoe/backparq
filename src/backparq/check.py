@@ -1,5 +1,7 @@
 """Backup listing."""
 
+from __future__ import annotations
+
 import json
 import logging
 from collections import defaultdict
@@ -7,7 +9,7 @@ from collections import defaultdict
 from rich.table import Table
 
 from backparq.config import BackparqConfig
-from backparq.console import (
+from backparq.utils.console import (
     console,
     format_count,
     format_size,
@@ -15,7 +17,7 @@ from backparq.console import (
     print_success,
     print_warning,
 )
-from backparq.s3 import s3_client_from_config
+from backparq.storage.s3 import create_client as s3_client_from_config
 
 logger = logging.getLogger(__name__)
 

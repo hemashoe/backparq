@@ -1,0 +1,23 @@
+# Backparq Restore Configuration
+# Used by the 'restore' command to connect to DB and S3.
+# Note: 'restore' command-line arguments (start/end/backup-id) override defaults here.
+
+database:
+  host: localhost
+  port: 5432
+  name: restoration_db
+  user: postgres
+  password: password
+
+s3:
+  bucket: my-archive-bucket
+  prefix: data-offload # Must match the prefix used during archiving
+  region: us-east-1
+
+archive:
+  mode: offload # This informs restore where to look by default (archive/ vs backups/ prefix)
+  tables:
+    - table: public.events
+      primary_key: id # Critical for 'upsert' conflict mode
+    - table: public.users
+      primary_key: id

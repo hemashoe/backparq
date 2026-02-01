@@ -1,5 +1,7 @@
 """CLI for backparq."""
 
+from __future__ import annotations
+
 import argparse
 import json
 import logging
@@ -9,13 +11,13 @@ from pathlib import Path
 from backparq.archive import archive_tables
 from backparq.check import check_backups
 from backparq.config import BackparqConfig, ConfigError, load_config, parse_utc_datetime
-from backparq.console import print_error, print_success, print_warning
-from backparq.cron import install_cron
+from backparq.utils.console import print_error, print_success, print_warning
 from backparq.db import test_pg_connection
-from backparq.parquet import build_encryption_properties
+from backparq.storage.parquet import build_encryption
 from backparq.prune import prune_backups
+from backparq.plan import plan_archive
 from backparq.restore import restore_tables
-from backparq.s3 import verify_s3_connection
+from backparq.storage.s3 import verify_connection as verify_s3_connection
 from backparq.status import show_status
 from backparq.verify import verify_archives
 
@@ -27,22 +29,7 @@ EXIT_RUNTIME_ERROR = 2
 EXIT_INTERRUPTED = 130
 
 
-def setup_logging(verbosity: int = 0) -> None:
-    if verbosity >= 2:
-        level, fmt = logging.DEBUG, "%(asctime)s %(levelname)-8s [%(name)s:%(lineno)d] %(message)s"
-    elif verbosity >= 1:
-        level, fmt = logging.INFO, "%(asctime)s %(levelname)-8s %(message)s"
-    else:
-        level, fmt = logging.WARNING, "%(levelname)-8s %(message)s"
-
-    logging.basicConfig(
-        level=level,
-        format=fmt,
-        datefmt="%Y-%m-%d %H:%M:%S",
-        handlers=[logging.StreamHandler(sys.stderr)],
-    )
-    for name in ["boto3", "botocore", "urllib3"]:
-        logging.getLogger(name).setLevel(logging.WARNING)
+from backparq.utils.logging import setup_logging
 
 
 def _load_config(path_str: str) -> BackparqConfig:
@@ -54,7 +41,7 @@ def _load_config(path_str: str) -> BackparqConfig:
 
 
 def run_tests(config: BackparqConfig) -> None:
-    build_encryption_properties(config.parquet)
+    build_encryption(config.parquet)
     test_pg_connection(config.database)
     if config.s3.bucket:
         verify_s3_connection(config.s3)
@@ -66,21 +53,42 @@ def handle_test(args):
     print_success("All connections validated")
 
 
+import signal
+import threading
+
 def handle_archive(args):
     config = _load_config(args.config)
     run_tests(config)
-    result = archive_tables(config, show_stats=args.stats)
-    if args.output == "json":
-        print(json.dumps(result.to_dict(), indent=2))
-    if not result.success:
-        sys.exit(EXIT_RUNTIME_ERROR)
+    
+    shutdown_event = threading.Event()
+    
+    def signal_handler(sig, frame):
+        logger.warning(f"Received signal {sig}, initiating graceful shutdown...")
+        shutdown_event.set()
+        
+    original_sigint = signal.getsignal(signal.SIGINT)
+    original_sigterm = signal.getsignal(signal.SIGTERM)
+    
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+    
+    try:
+        result = archive_tables(config, show_stats=args.stats, shutdown_event=shutdown_event)
+        if args.output == "json":
+            print(json.dumps(result.to_dict(), indent=2))
+        
+        if not result.success:
+            sys.exit(EXIT_RUNTIME_ERROR)
+    finally:
+        # Restore original handlers
+        signal.signal(signal.SIGINT, original_sigint)
+        signal.signal(signal.SIGTERM, original_sigterm)
 
 
 def handle_apply(args):
+    """Legacy command - just runs archive."""
     config = _load_config(args.config)
     run_tests(config)
-    if config.cron.enabled:
-        install_cron(config, Path(args.config))
     archive_tables(config)
 
 
@@ -100,6 +108,11 @@ def handle_check(args):
 
 def handle_prune(args):
     prune_backups(_load_config(args.config), dry_run=args.dry_run)
+
+
+def handle_plan(args):
+    plan = plan_archive(_load_config(args.config))
+    print(json.dumps(plan, indent=2, default=str))
 
 
 def handle_status(args):
@@ -178,6 +191,10 @@ Examples:
     parser.add_argument(
         "-v", "--verbose", action="count", default=0, help="Verbosity (-v INFO, -vv DEBUG)"
     )
+    parser.add_argument(
+        "--log-format", choices=["text", "json"], default="text",
+        help="Log format (text or json for structured logs)"
+    )
     sub = parser.add_subparsers(dest="command", required=True)
 
     p = sub.add_parser("test", help="Test connections")
@@ -212,6 +229,10 @@ Examples:
     p.add_argument("--dry-run", action="store_true")
     p.set_defaults(func=handle_prune)
 
+    p = sub.add_parser("plan", help="Generate archive plan (JSON)")
+    p.add_argument("--config", required=True)
+    p.set_defaults(func=handle_plan)
+
     p = sub.add_parser("status", help="Show archive status")
     p.add_argument("--config", required=True)
     p.add_argument("--table", help="Filter table")
@@ -235,7 +256,7 @@ Examples:
 def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
-    setup_logging(args.verbose)
+    setup_logging(args.verbose, log_format=getattr(args, "log_format", "text"))
 
     try:
         args.func(args)

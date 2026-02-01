@@ -1,5 +1,5 @@
 """
-Unit tests for backparq.s3 module.
+Unit tests for backparq.storage.s3 module.
 """
 
 from unittest.mock import MagicMock, patch
@@ -7,9 +7,9 @@ from unittest.mock import MagicMock, patch
 import botocore.exceptions
 import pytest
 
-from backparq.s3 import (
-    s3_verify_object_sha256,
-    verify_s3_connection,
+from backparq.storage.s3 import (
+    verify_checksum as s3_verify_object_sha256,
+    verify_connection as verify_s3_connection,
 )
 
 
@@ -58,7 +58,7 @@ class TestVerifyS3Connection:
         config = MagicMock()
         config.bucket = "test-bucket"
 
-        with patch("backparq.s3.s3_client_from_config") as mock_client:
+        with patch("backparq.storage.s3.create_client") as mock_client:
             mock_s3 = MagicMock()
             mock_client.return_value = mock_s3
 
@@ -70,7 +70,7 @@ class TestVerifyS3Connection:
         config = MagicMock()
         config.bucket = "test-bucket"
 
-        with patch("backparq.s3.s3_client_from_config") as mock_client:
+        with patch("backparq.storage.s3.create_client") as mock_client:
             mock_s3 = MagicMock()
             error_response = {"Error": {"Code": "403"}}
             mock_s3.head_bucket.side_effect = botocore.exceptions.ClientError(

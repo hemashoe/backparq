@@ -1,0 +1,24 @@
+# Backparq Offload Configuration
+# Moves data older than 90 days to S3 and deletes it from the database.
+
+database:
+  host: localhost
+  port: 5432
+  name: source_db
+  user: postgres
+  password: password
+
+s3:
+  bucket: my-archive-bucket
+  prefix: data-offload
+  region: us-east-1
+
+archive:
+  mode: offload
+  cutoff: -90d
+  order_by: created_at
+  perform_delete: true
+
+  tables:
+    - public.events
+    - public.users

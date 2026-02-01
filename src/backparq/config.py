@@ -5,6 +5,8 @@ Handles loading, parsing, and validating YAML configuration files.
 Supports environment variable expansion and config file includes.
 """
 
+from __future__ import annotations
+
 import datetime as dt
 import logging
 import os
@@ -26,10 +28,7 @@ DEFAULT_COMPRESSION = "snappy"
 DEFAULT_PRIMARY_KEY = "id"
 
 
-class ConfigError(ValueError):
-    """Raised when configuration is invalid."""
-
-    pass
+from backparq.exceptions import ConfigError
 
 
 @dataclass(frozen=True)
@@ -91,6 +90,7 @@ class ParquetConfig:
     """Parquet file configuration."""
 
     compression: str = DEFAULT_COMPRESSION
+    row_group_size: int = 100_000
     encryption: ParquetEncryptionConfig = field(default_factory=ParquetEncryptionConfig)
 
 
@@ -102,6 +102,11 @@ class RetentionConfig:
     days: int = 0
     months: int = 0
 
+    @property
+    def total_days(self) -> int:
+        """Total retention in days (months converted to 30 days each)."""
+        return self.days + (self.months * 30)
+
 
 @dataclass(frozen=True)
 class TableConfig:
@@ -109,6 +114,7 @@ class TableConfig:
 
     name: str
     primary_key: str = DEFAULT_PRIMARY_KEY
+    masking: dict[str, str] = field(default_factory=dict)
 
     def __str__(self) -> str:
         return self.name
@@ -130,6 +136,7 @@ class ArchiveConfig:
     order_by: str = DEFAULT_ORDER_BY
     concurrency: int = 1
     chunk_concurrency: int = 1
+    vacuum: bool = False
     retention: RetentionConfig = field(default_factory=RetentionConfig)
 
     def __post_init__(self):
@@ -164,6 +171,16 @@ class CronConfig:
 
 
 @dataclass(frozen=True)
+class NotificationConfig:
+    """Notification configuration."""
+    
+    enabled: bool = False
+    urls: list[str] = field(default_factory=list)
+    on_success: bool = False
+    on_failure: bool = True
+
+
+@dataclass(frozen=True)
 class BackparqConfig:
     """Root configuration object."""
 
@@ -172,6 +189,7 @@ class BackparqConfig:
     parquet: ParquetConfig
     archive: ArchiveConfig
     cron: CronConfig = field(default_factory=CronConfig)
+    notifications: Optional[NotificationConfig] = None
 
 
 # =============================================================================
@@ -305,6 +323,7 @@ def _parse_parquet(data: dict[str, Any]) -> ParquetConfig:
 
     return ParquetConfig(
         compression=_optional_str(data, "compression", DEFAULT_COMPRESSION),
+        row_group_size=_optional_int(data, "row_group_size", 100_000),
         encryption=encryption,
     )
 
@@ -345,7 +364,8 @@ def _parse_tables(tables_data: list) -> list[TableConfig]:
             if not isinstance(table_name, str) or not table_name.strip():
                 raise ConfigError("Table config must have 'table' or 'name' key with string value.")
             pk = _optional_str(item, "primary_key", DEFAULT_PRIMARY_KEY)
-            parsed_tables.append(TableConfig(name=table_name.strip(), primary_key=pk))
+            masking = _optional_str_map(item, "masking")
+            parsed_tables.append(TableConfig(name=table_name.strip(), primary_key=pk, masking=masking))
         else:
             raise ConfigError(f"Invalid table entry: {item}. Must be string or dict.")
 
@@ -386,6 +406,7 @@ def _parse_archive(data: dict[str, Any]) -> ArchiveConfig:
         order_by=_optional_str(data, "order_by", DEFAULT_ORDER_BY),
         concurrency=_optional_int(data, "concurrency", 1),
         chunk_concurrency=_optional_int(data, "chunk_concurrency", 1),
+        vacuum=_optional_bool(data, "vacuum", False),
         retention=_parse_retention(data.get("retention", {})),
     )
 
@@ -401,6 +422,23 @@ def _parse_cron(data: Optional[dict[str, Any]]) -> CronConfig:
         enabled=_optional_bool(data, "enabled", False),
         schedule=_optional_str(data, "schedule"),
         command=_optional_str(data, "command"),
+    )
+
+
+def _parse_notifications(data: Optional[dict[str, Any]]) -> Optional[NotificationConfig]:
+    """Parse notification configuration section."""
+    if not data:
+        return None
+        
+    urls = data.get("urls", [])
+    if isinstance(urls, str):
+        urls = [urls]
+        
+    return NotificationConfig(
+        enabled=True,
+        urls=[u for u in urls if isinstance(u, str) and u],
+        on_success=_optional_bool(data, "on_success", False),
+        on_failure=_optional_bool(data, "on_failure", True),
     )
 
 
@@ -494,6 +532,7 @@ def load_config(path: Path) -> BackparqConfig:
     parquet = _parse_parquet(merged.get("parquet", {}))
     archive = _parse_archive(_require_section(merged, "archive"))
     cron = _parse_cron(merged.get("cron"))
+    notifications = _parse_notifications(merged.get("notifications"))
 
     # Validate encryption config (only if enabled)
     if parquet.encryption.enabled:
@@ -520,4 +559,5 @@ def load_config(path: Path) -> BackparqConfig:
         parquet=parquet,
         archive=archive,
         cron=cron,
+        notifications=notifications,
     )
