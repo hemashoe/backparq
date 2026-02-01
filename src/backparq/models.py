@@ -1,5 +1,7 @@
 """Data models for backparq."""
 
+from __future__ import annotations
+
 import datetime as dt
 from dataclasses import dataclass, field
 

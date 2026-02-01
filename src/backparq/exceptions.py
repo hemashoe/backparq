@@ -1,5 +1,7 @@
 """Exception hierarchy for backparq."""
 
+from __future__ import annotations
+
 
 class BackparqError(Exception):
     """Base exception for all backparq errors."""
@@ -7,7 +9,7 @@ class BackparqError(Exception):
     pass
 
 
-class ConfigError(BackparqError):
+class ConfigError(BackparqError, ValueError):
     """Configuration is invalid or missing."""
 
     pass

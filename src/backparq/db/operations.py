@@ -5,6 +5,8 @@ Handles PostgreSQL connections, data export, and deletion operations.
 Uses parameterized queries to prevent SQL injection.
 """
 
+from __future__ import annotations
+
 import datetime as dt
 import logging
 import time
@@ -52,16 +54,10 @@ def _table_identifier(table: str) -> sql.Composable:
 
 @retry(stop=stop_after_attempt(5), wait=wait_exponential(multiplier=1, min=2, max=30))
 def connect_pg(config: DatabaseConfig):
-    """
-    Create a new PostgreSQL connection with retry logic.
-
-    Note: In production, consider using a connection pool (e.g., psycopg2.pool)
-    for better resource management with concurrent operations.
-    """
-    logger.debug(f"Connecting to PostgreSQL at {config.host}:{config.port}/{config.name}")
+    """Create a PostgreSQL connection with retry logic."""
+    logger.debug(f"Connecting to {config.host}:{config.port}/{config.name}")
     conn = psycopg2.connect(config.dsn())
     conn.autocommit = False
-    logger.debug("PostgreSQL connection established")
     return conn
 
 
@@ -202,18 +198,13 @@ def export_chunk_to_parquet_streaming(
     parquet_path,
     order_by: str,
     fetch_size: int,
+    row_group_size: int,
     compression: str,
     encryption_properties,
+    masking: Optional[dict[str, str]] = None,
 ) -> int:
-    """
-    Stream rows from PostgreSQL to a Parquet file using server-side cursors.
-
-    Uses REPEATABLE READ isolation to ensure consistent snapshot of data.
-    Memory usage is constant regardless of table size due to streaming.
-
-    Returns the number of rows exported.
-    """
-    logger.info(f"Exporting {table} [{start.strftime('%Y-%m')}] to {parquet_path}")
+    """Stream rows to Parquet file. Returns row count."""
+    logger.info(f"Exporting {table} [{start.strftime('%Y-%m')}]")
     exported = 0
     writer = None
     schema = None
@@ -242,6 +233,10 @@ def export_chunk_to_parquet_streaming(
                 rows = cur.fetchmany(fetch_size)
                 if not rows:
                     break
+                
+                # Apply masking if configured
+                if masking:
+                     _apply_masking(rows, masking)
 
                 if schema is None:
                     import pyarrow as pa
@@ -254,13 +249,14 @@ def export_chunk_to_parquet_streaming(
                         schema,
                         compression=compression,
                         encryption_properties=encryption_properties,
+                        use_dictionary=True,
+                        data_page_size=1024 * 1024,
+                        write_batch_size=row_group_size,
                     )
                     logger.debug(f"Initialized Parquet writer with {len(schema)} columns")
 
                 assert schema is not None and writer is not None
-                rb = pa.Table.from_pylist(rows, schema=schema).to_batches(max_chunksize=len(rows))[
-                    0
-                ]
+                rb = pa.Table.from_pylist(rows, schema=schema).to_batches(max_chunksize=len(rows))[0]
                 writer.write_batch(rb)
                 exported += len(rows)
                 batch_count += 1
@@ -298,17 +294,8 @@ def delete_chunk_safely(
     batch_size: int,
     order_by: str = "created_at",
 ) -> int:
-    """
-    Delete rows in batches using ctid to minimize lock contention.
-
-    Uses CTE with LIMIT to process small batches and commits after each batch.
-    This prevents long-running transactions that could block other operations.
-
-    Returns the total number of rows deleted.
-    """
-    logger.info(
-        f"Deleting data from {table} [{start.strftime('%Y-%m')} to {end.strftime('%Y-%m')}]"
-    )
+    """Delete rows in batches. Returns total deleted."""
+    logger.info(f"Deleting {table} [{start.strftime('%Y-%m')}]")
     total = 0
 
     # Build the delete query with safe identifiers
@@ -342,6 +329,41 @@ def delete_chunk_safely(
 
     logger.info(f"Deletion complete: {total} rows removed from {table}")
     return total
+
+
+def delete_chunk_with_verification(
+    conn,
+    table: str,
+    expected_sha256: str,
+    s3_bucket: str,
+    s3_key: str,
+    s3_client,
+    start: dt.datetime,
+    end: dt.datetime,
+    order_by: str,
+    config,  # BackparqConfig for batch_size
+) -> bool:
+    """Delete chunk after verifying S3 backup exists and matches checksum."""
+    from backparq.s3 import s3_verify_object_sha256
+    
+    logger.info(f"Pre-delete verification for {table} [{start.strftime('%Y-%m')}]")
+    
+    if not s3_verify_object_sha256(s3_client, s3_bucket, s3_key, expected_sha256):
+        logger.error(f"S3 verification failed for {s3_key}. Data NOT deleted.")
+        return False
+    
+    db_row_count = pg_count_rows(conn, table, start, end, order_by)
+    if db_row_count == 0:
+        logger.info("No rows to delete")
+        return True
+    
+    batch_size = getattr(config.archive, 'delete_batch_size', 10000)
+    deleted = delete_chunk_safely(conn, table, start, end, batch_size, order_by)
+    
+    if deleted != db_row_count:
+        logger.warning(f"Deleted {deleted} rows but expected {db_row_count}")
+    
+    return True
 
 
 def _serialize_for_postgres(value):
@@ -380,6 +402,8 @@ def insert_arrow_table_to_pg(
     - "upsert": Update existing rows with new values
 
     Uses a staging table pattern for atomic upserts.
+    Uses pyarrow.csv for fast serialization of primitive types, falling back
+    to Python serialization for complex types (arrays, JSON).
 
     Returns the number of rows inserted/updated.
     """
@@ -390,23 +414,65 @@ def insert_arrow_table_to_pg(
         return 0
 
     logger.info(f"Inserting {arrow_table.num_rows} rows into {table} (mode: {conflict_mode})")
+    
+    # Check for complex types that pyarrow.csv might not handle compatibly with Postgres
+    import pyarrow as pa
+    has_complex_types = False
+    for field in arrow_table.schema:
+        if pa.types.is_nested(field.type) or pa.types.is_dictionary(field.type):
+            has_complex_types = True
+            break
+            
+    if has_complex_types:
+        logger.debug("Schema contains complex types; using slow serialization path")
+    else:
+        logger.debug("Schema contains only primitive types; using fast serialization path")
+
     total_inserted = 0
     columns = arrow_table.column_names
     cols_quoted = [sql.Identifier(c) for c in columns]
     cols_str = sql.SQL(",").join(cols_quoted)
 
     for batch in arrow_table.to_batches(max_chunksize=batch_size):
-        rows = batch.to_pylist()
-        if not rows:
-            continue
+        if batch.num_rows == 0:
+             continue
 
-        buf = io.StringIO()
-        writer = csv.writer(buf, delimiter="\t", quoting=csv.QUOTE_MINIMAL, quotechar='"')
-
-        for row in rows:
-            csv_row = [_serialize_for_postgres(row[c]) for c in columns]
-            writer.writerow(csv_row)
-
+        buf = io.BytesIO()
+        
+        if not has_complex_types:
+            # FAST PATH: Use pyarrow.csv
+            import pyarrow.csv as pacsv
+            
+            # Configure pyarrow to write CSV compatible with Postgres COPY (FORMAT CSV)
+            # - No header
+            # - Tab delimiter (to match our COPY command)
+            # - Quote '"' (default)
+            # - Escape '"' (default)
+            # - Nulls as empty string (default)
+            write_options = pacsv.WriteOptions(
+                include_header=False,
+                delimiter="\t",
+                quoting_style="needed"
+            )
+            pacsv.write_csv(batch, buf, write_options=write_options)
+            
+            # pyarrow writes binary utf-8, perfect for BytesIO
+            
+        else:
+            # SLOW PATH: Manual serialization
+            # We must use StringIO for csv module
+            text_buf = io.StringIO()
+            writer = csv.writer(text_buf, delimiter="\t", quoting=csv.QUOTE_MINIMAL, quotechar='"')
+            
+            rows = batch.to_pylist()
+            for row in rows:
+                csv_row = [_serialize_for_postgres(row[c]) for c in columns]
+                writer.writerow(csv_row)
+            
+            # Encode to bytes for copy_expert
+            text_buf.seek(0)
+            buf.write(text_buf.getvalue().encode("utf-8"))
+            
         buf.seek(0)
 
         stage_table = f"stage_{int(time.time() * 1000000)}"
@@ -420,9 +486,11 @@ def insert_arrow_table_to_pg(
             cur.execute(create_stage)
 
             # COPY data into staging table
+            # We use FORMAT CSV to strictly handle quoting
             copy_sql = sql.SQL(
                 "COPY {stage} ({cols}) FROM STDIN WITH (FORMAT CSV, DELIMITER E'\\t', QUOTE '\"', NULL '')"
             ).format(stage=stage_ident, cols=cols_str)
+            
             cur.copy_expert(copy_sql.as_string(conn), buf)
 
             # Build INSERT/UPSERT query
@@ -459,3 +527,51 @@ def insert_arrow_table_to_pg(
     conn.commit()
     logger.info(f"Insert complete: {total_inserted} rows affected")
     return total_inserted
+
+def vacuum_table(config: DatabaseConfig, table: str) -> None:
+    """
+    Run VACUUM ANALYZE on a table to reclaim storage.
+
+    Must run outside of a transaction block (autocommit=True).
+    """
+    logger.info(f"Vacuuming table {table}...")
+    
+    # Create a fresh connection specifically for VACUUM
+    # We don't reuse the existing connection because we need autocommit=True
+    # and we don't want to mess with the main connection's state.
+    conn = psycopg2.connect(config.dsn())
+    try:
+        conn.autocommit = True
+        with conn.cursor() as cur:
+            query = sql.SQL("VACUUM ANALYZE {table}").format(table=_table_identifier(table))
+            cur.execute(query)
+        logger.info(f"Vacuum complete for {table}")
+    except Exception as e:
+        logger.error(f"Vacuum failed for {table}: {e}")
+        # Don't raise, just log error as this is maintenance
+    finally:
+        conn.close()
+
+def _apply_masking(rows: list[dict], masking: dict[str, str]) -> None:
+    """Apply masking rules to a batch of rows in-place."""
+    import hashlib
+    
+    for row in rows:
+        for col, rule in masking.items():
+            if col not in row or row[col] is None:
+                continue
+                
+            val = str(row[col])
+            
+            if rule == "hash":
+                # SHA256 hash
+                row[col] = hashlib.sha256(val.encode("utf-8")).hexdigest()
+            elif rule == "redact":
+                # Fixed string
+                row[col] = "***REDACTED***"
+            elif rule == "partial":
+                # Show last 4 chars
+                if len(val) > 4:
+                    row[col] = "*" * (len(val) - 4) + val[-4:]
+                else:
+                    row[col] = val

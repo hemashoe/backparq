@@ -1,0 +1,23 @@
+# Backparq Backup Configuration
+# Creates a full snapshot of tables in S3. Use for disaster recovery.
+
+database:
+  host: localhost
+  port: 5432
+  name: source_db
+  user: postgres
+  password: password
+
+s3:
+  bucket: my-backup-bucket
+  prefix: daily-backups
+  region: us-east-1
+
+archive:
+  mode: backup
+  # Backup mode ignores cutoff - it processes everything
+  concurrency: 4
+
+  tables:
+    - public.events
+    - public.users

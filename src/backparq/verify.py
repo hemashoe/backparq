@@ -1,11 +1,13 @@
 """Verify archived data integrity."""
 
+from __future__ import annotations
+
 import logging
 from pathlib import Path
 from typing import Optional
 
 from backparq.config import BackparqConfig
-from backparq.console import (
+from backparq.utils.console import (
     console,
     create_progress,
     print_error,
@@ -14,8 +16,8 @@ from backparq.console import (
     print_warning,
 )
 from backparq.models import VerifyResult
-from backparq.parquet import load_manifest, sha256_file
-from backparq.s3 import s3_client_from_config, s3_verify_object_sha256
+from backparq.storage.parquet import load_manifest, compute_sha256
+from backparq.storage.s3 import create_client as s3_client_from_config, verify_checksum as s3_verify_object_sha256
 
 logger = logging.getLogger(__name__)
 
@@ -80,7 +82,7 @@ def verify_archives(
 
             expected_sha = manifest.get("sha256", "")
             if expected_sha:
-                actual_sha = sha256_file(parquet_path)
+                actual_sha = compute_sha256(parquet_path)
                 if actual_sha != expected_sha:
                     result.files_corrupted += 1
                     result.errors.append(f"Checksum mismatch: {parquet_path.name}")

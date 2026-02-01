@@ -1,16 +1,15 @@
 """
-Unit tests for backparq.parquet module.
+Unit tests for backparq.storage.parquet module.
 """
 
 import tempfile
 from pathlib import Path
 
-from backparq.parquet import (
+from backparq.storage.parquet import (
     load_manifest,
     safe_mkdir,
-    sha256_file,
+    compute_sha256 as sha256_file,
     write_manifest,
-    write_text,
 )
 
 
@@ -38,13 +37,13 @@ class TestSha256File:
 
 
 class TestWriteText:
-    """Tests for write_text function."""
+    """Tests for write_text via Path."""
 
     def test_write_and_read(self):
         """Test writing and reading text."""
         with tempfile.TemporaryDirectory() as tmpdir:
             path = Path(tmpdir) / "test.txt"
-            write_text(path, "test content")
+            path.write_text("test content")
             assert path.read_text() == "test content"
 
 
