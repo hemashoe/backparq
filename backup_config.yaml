@@ -1,0 +1,37 @@
+database:
+  host: localhost
+  port: 5432
+  name: source_db
+  user: postgres
+  password: password
+  pool_size: 10
+
+s3:
+  bucket: test-bucket
+  prefix: backparq-test-backup
+  region: us-east-1
+  endpoint_url: http://localhost:9000
+  access_key_id: minioadmin
+  secret_access_key: minioadmin
+  use_ssl: false
+  verify_ssl: false
+  addressing_style: path
+
+archive:
+  mode: backup
+  perform_delete: false
+  base_dir: ./test_data_backup
+  chunk_rows: 500000
+  concurrency: 4
+  tables:
+    - name: public.events
+      primary_key: id
+      order_by: created_at
+      chunk_months: 1
+
+parquet:
+  compression: zstd
+  row_group_size: 100000
+
+notifications:
+  enabled: false

@@ -7,18 +7,19 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from backparq.archive import archive_tables
+from rich.prompt import Prompt
+
+from backparq import archive_tables
 from backparq.check import check_backups
 from backparq.config import BackparqConfig, ConfigError, load_config, parse_utc_datetime
 from backparq.db import test_pg_connection
+from backparq.pipeline import restore_tables, verify_archives
 from backparq.plan import plan_archive
 from backparq.prune import prune_backups
-from backparq.restore import restore_tables
 from backparq.status import show_status
 from backparq.storage.parquet import build_encryption
 from backparq.storage.s3 import verify_connection as verify_s3_connection
 from backparq.utils.console import console, print_error, print_info, print_success, print_warning
-from backparq.verify import verify_archives
 
 logger = logging.getLogger(__name__)
 
@@ -105,7 +106,7 @@ def handle_restore(args: argparse.Namespace) -> None:
 
 
 def handle_check(args: argparse.Namespace) -> None:
-    check_backups(_load_config(args.config))
+    check_backups(_load_config(args.config), output_json=args.output == "json")
 
 
 def handle_prune(args: argparse.Namespace) -> None:
@@ -121,6 +122,69 @@ def handle_status(args: argparse.Namespace) -> None:
     show_status(
         _load_config(args.config), table_filter=args.table, output_json=args.output == "json"
     )
+
+
+def handle_history(args: argparse.Namespace) -> None:
+    from backparq.status import show_history
+
+    show_history(_load_config(args.config), limit=args.limit, output_json=args.output == "json")
+
+
+def handle_resume(args: argparse.Namespace) -> None:
+    config = _load_config(args.config)
+    run_tests(config)
+
+    # If run_id not provided, find last failed
+    if not args.run_id:
+        # We need to fetch history without showing it, but show_history shows it.
+        # Let's use catalog directly.
+        from backparq.adapters.catalog import Catalog
+        from backparq.status import show_history
+
+        db_path = config.archive.base_dir / "backparq.db"
+        if not db_path.exists():
+            print_error("No catalog found to resume from.")
+            sys.exit(1)
+
+        with Catalog(db_path) as catalog:
+            history = catalog.get_history(limit=10)
+            for run in history:
+                if run["status"] == "failed":
+                    args.run_id = run["id"]
+                    print_info(f"Resuming last failed run: {args.run_id}")
+                    break
+
+        if not args.run_id:
+            print_warning("No recent failed runs found to resume.")
+            # We proceed anyway? Or exit?
+            # User might just want to run archive.
+            # But command is "resume".
+            if not Prompt.ask("Start a new run?", choices=["y", "n"], default="y") == "y":
+                sys.exit(0)
+
+    # Re-use handle_archive logic
+    # But handle_archive takes args and parses config again.
+    # We can just call archive_tables directly.
+
+    shutdown_event = threading.Event()
+
+    def signal_handler(sig: int, frame: Any) -> None:
+        logger.warning(f"Received signal {sig}, initiating graceful shutdown...")
+        shutdown_event.set()
+
+    original_sigint = signal.getsignal(signal.SIGINT)
+    original_sigterm = signal.getsignal(signal.SIGTERM)
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+
+    try:
+        # We pass the CURRENT config. Idempotency handles the "resume" part.
+        result = archive_tables(config, show_stats=args.stats, shutdown_event=shutdown_event)
+        if not result.success:
+            sys.exit(EXIT_RUNTIME_ERROR)
+    finally:
+        signal.signal(signal.SIGINT, original_sigint)
+        signal.signal(signal.SIGTERM, original_sigterm)
 
 
 def handle_verify(args: argparse.Namespace) -> None:
@@ -179,8 +243,6 @@ def handle_query(args: argparse.Namespace) -> None:
 
 
 def handle_init(args: argparse.Namespace) -> None:
-    from rich.prompt import Prompt
-
     from backparq.utils.console import console
 
     console.print("[bold]Backparq Configuration Generator[/bold]")
@@ -288,6 +350,7 @@ Examples:
 
     p = sub.add_parser("check", help="List S3 backups")
     p.add_argument("--config", required=True)
+    p.add_argument("--output", choices=["text", "json"], default="text")
     p.set_defaults(func=handle_check)
 
     p = sub.add_parser("prune", help="Delete old backups")
@@ -315,6 +378,18 @@ Examples:
     p = sub.add_parser("init", help="Generate config file")
     p.add_argument("--output", "-o", help="Output path")
     p.set_defaults(func=handle_init)
+
+    p = sub.add_parser("history", help="Show run history")
+    p.add_argument("--config", required=True)
+    p.add_argument("--limit", type=int, default=20, help="Number of runs to show")
+    p.add_argument("--output", choices=["text", "json"], default="text")
+    p.set_defaults(func=handle_history)
+
+    p = sub.add_parser("resume", help="Resume a failed run (alias for archive)")
+    p.add_argument("--config", required=True)
+    p.add_argument("--run-id", help="Run ID to resume (defaults to last failed)")
+    p.add_argument("--stats", action="store_true", help="Show statistics")
+    p.set_defaults(func=handle_resume)
 
     return parser
 

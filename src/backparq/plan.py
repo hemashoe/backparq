@@ -1,12 +1,15 @@
+"""Archive planning — generate a plan of chunks to archive."""
+
 from __future__ import annotations
 
 import datetime as dt
 import logging
+from pathlib import Path
 from typing import Any
 
-from backparq.archive import chunk_paths
 from backparq.config import BackparqConfig
 from backparq.db import connect_pg, list_chunks, pg_count_rows
+from backparq.primitives import chunk_paths
 from backparq.storage.parquet import load_manifest
 from backparq.storage.s3 import create_client as s3_client_from_config
 
@@ -14,8 +17,10 @@ logger = logging.getLogger(__name__)
 
 
 def plan_archive(config: BackparqConfig) -> dict[str, Any]:
-    """
-    Generate a plan of what chunks needs to be archived.
+    """Generate a plan of chunks that need to be archived.
+
+    Checks both the local catalog (if available) and S3 manifests
+    to determine which chunks still need processing.
 
     Returns a dict structure suitable for JSON output.
     """
@@ -28,20 +33,24 @@ def plan_archive(config: BackparqConfig) -> dict[str, Any]:
         },
     }
 
+    # Try loading catalog for state awareness
+    catalog = None
+    catalog_path = config.archive.base_dir / "backparq.db"
+    if catalog_path.exists():
+        from backparq.adapters.catalog import Catalog, ChunkState
+
+        catalog = Catalog(catalog_path)
+
     s3 = None
     if config.s3.bucket:
         try:
-            # Just instantiate, don't necessarily need to verify connection strict if we accept potential failure
-            # But good to have s3 client for existence checks
             s3 = s3_client_from_config(config.s3)
         except Exception:
             pass
 
     conn = connect_pg(config.database)
     try:
-        table_names = config.archive.table_names
-
-        for table in table_names:
+        for table in config.archive.table_names:
             table_plan: dict[str, Any] = {
                 "name": table,
                 "chunks": [],
@@ -63,7 +72,6 @@ def plan_archive(config: BackparqConfig) -> dict[str, Any]:
                     "reason": "unknown",
                 }
 
-                # Count rows
                 db_rows = pg_count_rows(
                     conn, chunk.table, chunk.start, chunk.end, config.archive.order_by
                 )
@@ -75,24 +83,25 @@ def plan_archive(config: BackparqConfig) -> dict[str, Any]:
                     table_plan["chunks"].append(chunk_info)
                     continue
 
-                # Check if exists
-                # This logic duplicates some of archive.py but simpler
-                _, _, _, manifest_path = chunk_paths(config.archive.base_dir, chunk)
-                existing = load_manifest(manifest_path)
+                # Check catalog first (authoritative state)
                 already_done = False
+                chunk_id = f"{chunk.table}_{chunk.start.strftime('%Y%m%d%H%M%S')}"
 
-                if existing and not config.archive.overwrite:
-                    expected = existing.get("exported_rows")
-                    sha = existing.get("sha256", "")
-                    # Ideally we check S3 too if configured
-                    if config.s3.bucket and s3 and existing.get("s3_key"):
-                        # Lightweight check? or full verify?
-                        # For plan, maybe just assume manifest is correct or do quick head object?
-                        # doing full verify might be slow for plan.
-                        # check if we can trust manifest
+                if catalog:
+                    state = catalog.get_state(chunk_id)
+                    if state and state >= ChunkState.EXPORTED:
                         already_done = True
-                    elif expected is not None:
-                        already_done = True  # Local only
+
+                # Fallback: check manifest files
+                if not already_done:
+                    _, _, _, manifest_path = chunk_paths(config.archive.base_dir, chunk)
+                    existing = load_manifest(manifest_path)
+
+                    if existing and not config.archive.overwrite:
+                        if s3 and config.s3.bucket and existing.get("s3_key"):
+                            already_done = True
+                        elif existing.get("exported_rows") is not None:
+                            already_done = True
 
                 if already_done:
                     chunk_info["action"] = "skip"
@@ -101,7 +110,7 @@ def plan_archive(config: BackparqConfig) -> dict[str, Any]:
                     plan["summary"]["total_chunks_existing"] += 1
                 else:
                     chunk_info["action"] = "archive"
-                    chunk_info["reason"] = "new_data" if not existing else "overwrite_needed"
+                    chunk_info["reason"] = "new_data" if not catalog else "pending"
                     table_plan["stats"]["to_archive"] += 1
                     plan["summary"]["total_chunks_to_archive"] += 1
                     plan["summary"]["total_rows_to_archive"] += db_rows

@@ -39,6 +39,21 @@ def show_status(
             else "S3: Not configured"
         )
         console.print(f"Base Dir: {config.archive.base_dir}")
+
+        # Catalog Stats
+        cat_stats = _get_catalog_stats(config)
+        if cat_stats:
+            console.print(
+                f"Catalog: {cat_stats['total_runs']} runs, {cat_stats['total_chunks']} chunks tracked"
+            )
+            states = []
+            for state, count in cat_stats.get("chunks_by_state", {}).items():
+                state_name = {1: "IN_DB", 2: "EXPORTED", 3: "UPLOADED", 4: "OFFLOADED"}.get(
+                    state, str(state)
+                )
+                states.append(f"{state_name}={count}")
+            if states:
+                console.print(f"States:  {', '.join(states)}")
         console.print()
 
     conn = connect_pg(config.database)
@@ -220,3 +235,69 @@ def _get_s3_stats(s3: Any, bucket: str, prefix: str, table: str, mode: str) -> d
         logger.debug(f"S3 error: {e}")
 
     return stats
+
+
+def show_history(config: BackparqConfig, limit: int = 20, output_json: bool = False) -> list[dict]:
+    """Show run history from catalog."""
+    from backparq.adapters.catalog import Catalog
+
+    # Use correct catalog path from pipeline.py logic: base_dir / "backparq.db"
+    db_path = config.archive.base_dir / "backparq.db"
+
+    if not db_path.exists():
+        if not output_json:
+            print_warning("No catalog found.")
+        return []
+
+    with Catalog(db_path) as catalog:
+        history = catalog.get_history(limit)
+
+    if output_json:
+        print(json.dumps(history, indent=2, default=str))
+        return history
+
+    print_header("BACKPARQ HISTORY")
+    table = Table(show_header=True, header_style="bold")
+    table.add_column("Run ID")
+    table.add_column("Mode")
+    table.add_column("Started")
+    table.add_column("Duration", justify="right")
+    table.add_column("Status")
+    table.add_column("Error")
+
+    for run in history:
+        import datetime as dt
+
+        start = dt.datetime.fromisoformat(run["started_at"])
+        duration = "-"
+        if run["finished_at"]:
+            end = dt.datetime.fromisoformat(run["finished_at"])
+            delta = end - start
+            duration = str(delta).split(".")[0]  # Remove microseconds
+
+        status_style = {"completed": "green", "failed": "red", "running": "yellow"}.get(
+            run["status"], "white"
+        )
+
+        table.add_row(
+            run["id"],
+            run["mode"],
+            start.strftime("%Y-%m-%d %H:%M"),
+            duration,
+            f"[{status_style}]{run['status']}[/{status_style}]",
+            run["error"] or "",
+        )
+
+    console.print(table)
+    return history
+
+
+def _get_catalog_stats(config: BackparqConfig) -> dict:
+    from backparq.adapters.catalog import Catalog
+
+    db_path = config.archive.base_dir / "backparq.db"
+    if not db_path.exists():
+        return {}
+
+    with Catalog(db_path) as catalog:
+        return catalog.get_stats()

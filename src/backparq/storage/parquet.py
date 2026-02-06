@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 import logging
 from collections.abc import Iterator
@@ -13,6 +12,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from backparq.config import ParquetConfig
+from backparq.primitives.checksum import compute_sha256
 
 logger = logging.getLogger(__name__)
 
@@ -20,15 +20,6 @@ logger = logging.getLogger(__name__)
 def safe_mkdir(path: Path) -> None:
     """Create directory and parents."""
     path.mkdir(parents=True, exist_ok=True)
-
-
-def compute_sha256(path: Path, buf_size: int = 8 * 1024 * 1024) -> str:
-    """Compute SHA256 hash of file."""
-    h = hashlib.sha256()
-    with path.open("rb") as f:
-        while chunk := f.read(buf_size):
-            h.update(chunk)
-    return h.hexdigest()
 
 
 def write_manifest(path: Path, data: dict) -> None:
@@ -74,11 +65,9 @@ def read_parquet(path: Path, decryption_props: Any = None) -> pa.Table:
 def read_parquet_batches(
     path: Path, batch_size: int = 10_000, decryption_props: Any = None
 ) -> Iterator[pa.RecordBatch]:
-    """
-    Stream Parquet file as batches to handle large files without memory issues.
+    """Stream Parquet file as batches for large files.
 
     Yields Arrow RecordBatches that can be processed incrementally.
-    This is preferred for restore operations on large files.
 
     Args:
         path: Path to the Parquet file

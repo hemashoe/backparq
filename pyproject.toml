@@ -46,11 +46,13 @@ classifiers = [
 ]
 dependencies = [
     "boto3>=1.28.0",
-    "psycopg2-binary>=2.9.0",
+    "psycopg[binary]>=3.1.0",
+    "psycopg-pool>=3.1.0",
     "pyarrow>=12.0.0",
     "PyYAML>=6.0.0",
     "tenacity>=8.0.0",
     "rich>=13.0.0",
+    "duckdb>=0.9.0",
 ]
 
 [project.optional-dependencies]
@@ -63,10 +65,8 @@ dev = [
     "testcontainers[postgres,minio]>=3.7.0",
     "types-PyYAML",
 ]
-query = ["duckdb>=0.9.0"]
 notifications = ["httpx>=0.25.0"]
 all = [
-    "duckdb>=0.9.0",
     "httpx>=0.25.0",
 ]
 
@@ -151,4 +151,9 @@ ignore = [
 [tool.ruff.lint.per-file-ignores]
 # plan.py has variables for planned future use
 "src/backparq/plan.py" = ["F841"]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3.5",
+]
 

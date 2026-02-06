@@ -7,13 +7,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
 
-import psycopg2
-import psycopg2.extensions
-import psycopg2.extras
-from psycopg2 import sql
-from tenacity import retry, stop_after_attempt, wait_exponential
+import psycopg
+from psycopg import sql
+from psycopg.rows import dict_row
 
 from backparq.config import BackparqConfig, DatabaseConfig
+from backparq.db.connection import connect as connect_pg
+from backparq.db.connection import test_connection as test_pg_connection
+from backparq.primitives.chunking import add_months, month_floor, normalize_dt
 
 logger = logging.getLogger(__name__)
 
@@ -46,29 +47,7 @@ def _table_identifier(table: str) -> sql.Composable:
     return sql.Identifier(table_name)
 
 
-@retry(stop=stop_after_attempt(5), wait=wait_exponential(multiplier=1, min=2, max=30))
-def connect_pg(config: DatabaseConfig) -> psycopg2.extensions.connection:
-    """Create a PostgreSQL connection with retry logic."""
-    logger.debug(f"Connecting to {config.host}:{config.port}/{config.name}")
-    conn = psycopg2.connect(config.dsn())
-    conn.autocommit = False
-    return conn
-
-
-def test_pg_connection(config: DatabaseConfig) -> None:
-    """Test that we can connect to PostgreSQL."""
-    logger.info(f"Testing PostgreSQL connection to {config.host}:{config.port}/{config.name}")
-    conn = connect_pg(config)
-    try:
-        with conn.cursor() as cur:
-            cur.execute("SELECT 1")
-            cur.fetchone()
-        logger.info("PostgreSQL connection test successful")
-    finally:
-        conn.close()
-
-
-def table_exists(conn: Any, table: str) -> bool:
+def table_exists(conn: psycopg.Connection, table: str) -> bool:
     """Check if a table exists in the database."""
     schema, table_name = _parse_table_name(table)
     if schema:
@@ -94,7 +73,7 @@ def table_exists(conn: Any, table: str) -> bool:
         return bool(result[0]) if result else False
 
 
-def validate_tables_exist(conn: Any, tables: list[str]) -> list[str]:
+def validate_tables_exist(conn: psycopg.Connection, tables: list[str]) -> list[str]:
     """Validate that all tables exist. Returns list of missing tables."""
     missing = []
     for table in tables:
@@ -103,29 +82,8 @@ def validate_tables_exist(conn: Any, tables: list[str]) -> list[str]:
     return missing
 
 
-def _normalize_dt(value: dt.datetime) -> dt.datetime:
-    """Normalize a datetime to UTC timezone-aware."""
-    if value.tzinfo is None:
-        value = value.replace(tzinfo=dt.timezone.utc)
-    return value.astimezone(dt.timezone.utc)
-
-
-def month_floor(value: dt.datetime) -> dt.datetime:
-    """Return the first day of the month for the given datetime."""
-    value = _normalize_dt(value)
-    return dt.datetime(value.year, value.month, 1, tzinfo=dt.timezone.utc)
-
-
-def add_months(value: dt.datetime, months: int) -> dt.datetime:
-    """Add months to a datetime, returning the first of the resulting month."""
-    value = _normalize_dt(value)
-    year = value.year + (value.month - 1 + months) // 12
-    month = (value.month - 1 + months) % 12 + 1
-    return dt.datetime(year, month, 1, tzinfo=dt.timezone.utc)
-
-
 def pg_get_min_created_at(
-    conn: Any, table: str, order_by: str = "created_at"
+    conn: psycopg.Connection, table: str, order_by: str = "created_at"
 ) -> Optional[dt.datetime]:
     """Get the minimum value of the order_by column in the table."""
     query = sql.SQL("SELECT min({column}) FROM {table}").format(
@@ -133,39 +91,73 @@ def pg_get_min_created_at(
     )
     with conn.cursor() as cur:
         cur.execute(query)
-        val = cur.fetchone()[0]
-        if val is None:
-            return None
-        return _normalize_dt(val)
+        row = cur.fetchone()
+        val = row[0] if row else None
+        return normalize_dt(val)
+
+
+def pg_get_max_id(
+    conn: psycopg.Connection,
+    table: str,
+    primary_key: str,
+    cutoff: dt.datetime,
+    order_by: str = "created_at",
+) -> Any:
+    """
+    Get the maximum ID for rows created before the cutoff.
+    This serves as the 'watermark' for safe deletion.
+    """
+    query = sql.SQL("SELECT max({pk}) FROM {table} WHERE {col} < %s").format(
+        pk=sql.Identifier(primary_key), table=_table_identifier(table), col=sql.Identifier(order_by)
+    )
+    with conn.cursor() as cur:
+        cur.execute(query, (cutoff,))
+        row = cur.fetchone()
+        val = row[0] if row else None
+        return val
 
 
 def pg_count_rows(
-    conn: Any, table: str, start: dt.datetime, end: dt.datetime, order_by: str = "created_at"
+    conn: psycopg.Connection,
+    table: str,
+    start: dt.datetime,
+    end: dt.datetime,
+    order_by: str = "created_at",
 ) -> int:
     """Count rows in the given time range."""
+    # This count is inherently approximate if not using snapshot isolation
     query = sql.SQL("SELECT count(*) FROM {table} WHERE {column} >= %s AND {column} < %s").format(
         table=_table_identifier(table), column=sql.Identifier(order_by)
     )
     with conn.cursor() as cur:
         cur.execute(query, (start, end))
-        return int(cur.fetchone()[0])
+        result = cur.fetchone()
+        return int(result[0]) if result else 0
 
 
-def pg_get_columns(conn: Any, table: str) -> list[str]:
+def pg_get_columns(conn: psycopg.Connection, table: str) -> list[str]:
     """Get list of column names for a table."""
     query = sql.SQL("SELECT * FROM {table} LIMIT 0").format(table=_table_identifier(table))
     with conn.cursor() as cur:
         cur.execute(query)
-        return [desc[0] for desc in cur.description]
+        if cur.description:
+            return [desc.name for desc in cur.description]
+        return []
 
 
 def list_chunks(
-    conn: Any, table: str, cutoff_exclusive: dt.datetime, order_by: str = "created_at"
+    conn: psycopg.Connection,
+    table: str,
+    cutoff_exclusive: dt.datetime,
+    order_by: str = "created_at",
+    target_rows: Optional[int] = None,
 ) -> list[ChunkSpec]:
     """
-    List monthly chunks of data to process up to the cutoff date.
+    List chunks of data to process up to the cutoff date.
 
-    Returns a list of ChunkSpec objects, each representing one month of data.
+    If target_rows is provided, recursively splits time ranges until each chunk
+    has <= target_rows (or duration is too small).
+     otherwise, uses monthly chunks.
     """
     min_dt = pg_get_min_created_at(conn, table, order_by)
     if min_dt is None:
@@ -173,149 +165,236 @@ def list_chunks(
         return []
 
     start = month_floor(min_dt)
-    cutoff = _normalize_dt(cutoff_exclusive)
+    cutoff = normalize_dt(cutoff_exclusive)
+    if cutoff is None:
+        cutoff = dt.datetime.now(dt.timezone.utc)
 
     chunks: list[ChunkSpec] = []
-    cur = start
-    while cur < cutoff:
-        nxt = add_months(cur, 1)
-        end = min(nxt, cutoff)
-        chunks.append(ChunkSpec(table=table, start=cur, end=end))
-        cur = nxt
 
-    logger.debug(f"Found {len(chunks)} chunks for table {table} from {start} to {cutoff}")
+    # Adaptive chunking
+    if target_rows:
+        logger.info(f"Using adaptive chunking with target_rows={target_rows}")
+        # Minimum duration to avoid infinite recursion (e.g. 1 hour)
+        min_duration = dt.timedelta(hours=1)
+
+        def _split_range(s: dt.datetime, e: dt.datetime) -> None:
+            if e <= s:
+                return
+
+            # Count rows in this range
+            count = pg_count_rows(conn, table, s, e, order_by)
+
+            # If count is small enough OR range is too small, yield chunk
+            if count <= target_rows or (e - s) <= min_duration:
+                if count > 0:
+                    chunks.append(ChunkSpec(table=table, start=s, end=e))
+                return
+
+            # Split in half
+            mid_ts = s + (e - s) / 2
+            _split_range(s, mid_ts)
+            _split_range(mid_ts, e)
+
+        cur = start
+        while cur < cutoff:
+            nxt = add_months(cur, 1)
+            end = min(nxt, cutoff)
+            _split_range(cur, end)
+            cur = nxt
+
+    else:
+        # Standard monthly chunks
+        cur = start
+        while cur < cutoff:
+            nxt = add_months(cur, 1)
+            end = min(nxt, cutoff)
+            chunks.append(ChunkSpec(table=table, start=cur, end=end))
+            cur = nxt
+
+    logger.debug(f"Found {len(chunks)} chunks for table {table}")
     return chunks
 
 
+import re
+
+_SAFE_IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def _validate_identifier(name: str, label: str) -> str:
+    """Validate that a name is a safe SQL identifier (no injection)."""
+    if not _SAFE_IDENTIFIER.match(name):
+        raise ValueError(
+            f"Unsafe {label} identifier: {name!r}. "
+            "Only alphanumeric characters and underscores are allowed."
+        )
+    return name
+
+
 def export_chunk_to_parquet_streaming(
-    conn: Any,
+    conn: psycopg.Connection,
     table: str,
     start: dt.datetime,
     end: dt.datetime,
     parquet_path: Path,
     order_by: str,
-    fetch_size: int,
     row_group_size: int,
     compression: str,
     encryption_properties: Any,
     masking: Optional[dict[str, str]] = None,
+    watermark_id: Any = None,
+    primary_key: str = "id",
+    db_config: Optional[DatabaseConfig] = None,
+    db_dsn: str = "",
 ) -> int:
-    """Stream rows to Parquet file. Returns row count."""
-    logger.info(f"Exporting {table} [{start.strftime('%Y-%m')}]")
-    exported = 0
-    writer = None
-    schema = None
+    """Export chunk using DuckDB postgres_scanner. Returns row count.
+
+    Args:
+        db_config: DatabaseConfig object (preferred — builds DSN safely).
+        db_dsn: Legacy fallback — raw DSN string. Use db_config instead.
+    """
+    import duckdb
+
+    logger.info(
+        f"Exporting {table} [{start.strftime('%Y-%m')}] via DuckDB"
+        + (f" (watermark: {watermark_id})" if watermark_id else "")
+    )
+
+    if encryption_properties is not None:
+        logger.warning("Parquet encryption is currently ignored with DuckDB export engine.")
+
+    # Build DSN safely from config, falling back to raw string only if needed
+    if db_config is not None:
+        safe_dsn = db_config.duckdb_dsn().replace("'", "''")
+    elif db_dsn:
+        safe_dsn = db_dsn.replace("'", "''")
+    else:
+        raw_dsn = conn.info.dsn
+        safe_dsn = raw_dsn.replace("'", "''")
+
+    schema, table_name = _parse_table_name(table)
+    schema = schema or "public"
+
+    # Validate identifiers to prevent SQL injection via config values
+    _validate_identifier(order_by, "order_by")
+    _validate_identifier(primary_key, "primary_key")
+    _validate_identifier(schema, "schema")
+    _validate_identifier(table_name, "table_name")
+
+    columns = pg_get_columns(conn, table)
+    select_exprs = []
+    masking = masking or {}
+    for col in columns:
+        _validate_identifier(col, "column")
+        if col in masking:
+            rule = masking[col]
+            if rule == "hash":
+                select_exprs.append(f'sha256(CAST("{col}" AS VARCHAR)) AS "{col}"')
+            elif rule == "redact":
+                select_exprs.append(f"'***REDACTED***' AS \"{col}\"")
+            elif rule == "partial":
+                select_exprs.append(
+                    f'CASE WHEN length(CAST("{col}" AS VARCHAR)) > 4 '
+                    f'THEN repeat(\'*\', CAST(length(CAST("{col}" AS VARCHAR)) AS INTEGER) - 4) || right(CAST("{col}" AS VARCHAR), 4) '
+                    f'ELSE CAST("{col}" AS VARCHAR) END AS "{col}"'
+                )
+            else:
+                select_exprs.append(f'"{col}"')
+        else:
+            select_exprs.append(f'"{col}"')
+
+    select_clause = ", ".join(select_exprs)
+
+    where_clauses = [
+        f"\"{order_by}\" >= '{start.isoformat()}'::TIMESTAMP",
+        f"\"{order_by}\" < '{end.isoformat()}'::TIMESTAMP",
+    ]
+    if watermark_id is not None:
+        if isinstance(watermark_id, str):
+            # String watermarks need quoting
+            safe_wm = str(watermark_id).replace("'", "''")
+            where_clauses.append(f"\"{primary_key}\" <= '{safe_wm}'")
+        else:
+            where_clauses.append(f'"{primary_key}" <= {watermark_id}')
+
+    where_clause = " AND ".join(where_clauses)
+
+    # DuckDB format parameters
+    codec = compression.upper() if compression else "SNAPPY"
+    if codec == "NONE":
+        codec = "UNCOMPRESSED"
+
+    query = f"""
+    COPY (
+        SELECT {select_clause}
+        FROM postgres_scan('{safe_dsn}', '{schema}', '{table_name}')
+        WHERE {where_clause}
+        ORDER BY "{order_by}"
+    ) TO '{parquet_path.as_posix()}' (FORMAT PARQUET, COMPRESSION '{codec}', ROW_GROUP_SIZE {row_group_size});
+    """
 
     try:
-        conn.rollback()
-        conn.set_session(
-            readonly=True,
-            isolation_level=psycopg2.extensions.ISOLATION_LEVEL_REPEATABLE_READ,
-            autocommit=False,
-        )
+        con = duckdb.connect()
+        con.execute("INSTALL postgres;")
+        con.execute("LOAD postgres;")
 
-        cursor_name = f"csr_{int(time.time() * 1000)}"
+        # Execute copy and fetch result
+        con.execute(query)
+        res = con.fetchall()
+        exported = res[0][0] if res else 0
 
-        # Build query using safe identifiers
-        query = sql.SQL(
-            "SELECT * FROM {table} WHERE {column} >= %s AND {column} < %s ORDER BY {column}"
-        ).format(table=_table_identifier(table), column=sql.Identifier(order_by))
-
-        with conn.cursor(name=cursor_name, cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            cur.itersize = fetch_size
-            cur.execute(query, (start, end))
-
-            batch_count = 0
-            while True:
-                rows = cur.fetchmany(fetch_size)
-                if not rows:
-                    break
-
-                # Apply masking if configured
-                if masking:
-                    _apply_masking(rows, masking)
-
-                if schema is None:
-                    import pyarrow as pa
-                    import pyarrow.parquet as pq
-
-                    t0 = pa.Table.from_pylist(rows)
-                    schema = pa.schema([pa.field(f.name, f.type, nullable=True) for f in t0.schema])
-                    writer = pq.ParquetWriter(
-                        parquet_path.as_posix(),
-                        schema,
-                        compression=compression,
-                        encryption_properties=encryption_properties,
-                        use_dictionary=True,
-                        data_page_size=1024 * 1024,
-                        write_batch_size=row_group_size,
-                    )
-                    logger.debug(f"Initialized Parquet writer with {len(schema)} columns")
-
-                assert schema is not None and writer is not None
-                rb = pa.Table.from_pylist(rows, schema=schema).to_batches(max_chunksize=len(rows))[
-                    0
-                ]
-                writer.write_batch(rb)
-                exported += len(rows)
-                batch_count += 1
-
-                if batch_count % 10 == 0:
-                    logger.debug(f"Exported {exported} rows so far...")
-
-        if writer is not None:
-            writer.close()
-
-        conn.commit()
         logger.info(f"Export complete: {exported} rows written to {parquet_path}")
         return exported
-
     except Exception as e:
-        logger.error(f"Export failed for {table}: {e}")
+        logger.error(f"DuckDB Export failed for {table}: {e}")
         raise
-    finally:
-        try:
-            conn.rollback()
-        except Exception:
-            pass
-        conn.set_session(
-            readonly=False,
-            isolation_level=psycopg2.extensions.ISOLATION_LEVEL_READ_COMMITTED,
-            autocommit=False,
-        )
 
 
 def delete_chunk_safely(
-    conn: Any,
+    conn: psycopg.Connection,
     table: str,
     start: dt.datetime,
     end: dt.datetime,
     batch_size: int,
     order_by: str = "created_at",
+    watermark_id: Any = None,
+    primary_key: str = "id",
 ) -> int:
     """Delete rows in batches. Returns total deleted."""
     logger.info(f"Deleting {table} [{start.strftime('%Y-%m')}]")
     total = 0
+
+    # If watermark is missing, we fall back to time-only deletion (DANGEROUS but backwards compatible)
+    if watermark_id is not None:
+        where_clause = sql.SQL("{column} >= %s AND {column} < %s AND {pk} <= %s").format(
+            column=sql.Identifier(order_by), pk=sql.Identifier(primary_key)
+        )
+        params: tuple = (start, end, watermark_id, batch_size)
+    else:
+        logger.warning(f"Deleting {table} without watermark! Race conditions possible.")
+        where_clause = sql.SQL("{column} >= %s AND {column} < %s").format(
+            column=sql.Identifier(order_by)
+        )
+        params = (start, end, batch_size)
 
     # Build the delete query with safe identifiers
     delete_query = sql.SQL("""
         WITH cte AS (
             SELECT ctid
             FROM {table}
-            WHERE {column} >= %s AND {column} < %s
+            WHERE {where}
             LIMIT %s
         )
         DELETE FROM {table} t
         USING cte
         WHERE t.ctid = cte.ctid
         RETURNING 1
-    """).format(table=_table_identifier(table), column=sql.Identifier(order_by))
+    """).format(table=_table_identifier(table), where=where_clause)
 
     with conn.cursor() as cur:
         batch_num = 0
         while True:
-            cur.execute(delete_query, (start, end, batch_size))
-            deleted = int(cur.rowcount)
+            cur.execute(delete_query, params)
+            deleted = cur.rowcount
             conn.commit()
             total += deleted
             batch_num += 1
@@ -330,8 +409,75 @@ def delete_chunk_safely(
     return total
 
 
+def pg_get_partitions_in_range(
+    conn: psycopg.Connection,
+    table: str,
+    start: dt.datetime,
+    end: dt.datetime,
+    order_by: str,
+) -> list[str]:
+    """Find partitions of a table that contain data in the given time range.
+
+    Uses pg_inherits + pg_class for reliable partition discovery instead of
+    EXPLAIN heuristics which can miss partitions based on planner statistics.
+    """
+    schema, table_name = _parse_table_name(table)
+    parent_schema = schema or "public"
+
+    # Get all child partitions from pg_inherits
+    query = sql.SQL("""
+        SELECT
+            child_ns.nspname || '.' || child_class.relname AS partition_name
+        FROM pg_inherits
+        JOIN pg_class parent_class ON pg_inherits.inhparent = parent_class.oid
+        JOIN pg_namespace parent_ns ON parent_class.relnamespace = parent_ns.oid
+        JOIN pg_class child_class ON pg_inherits.inhrelid = child_class.oid
+        JOIN pg_namespace child_ns ON child_class.relnamespace = child_ns.oid
+        WHERE parent_ns.nspname = %s
+          AND parent_class.relname = %s
+    """)
+
+    with conn.cursor() as cur:
+        cur.execute(query, (parent_schema, table_name))
+        all_partitions = [row[0] for row in cur.fetchall()]
+
+    if not all_partitions:
+        return []
+
+    # Filter partitions: check which ones actually contain data in the time range
+    partitions_with_data = []
+    for partition in all_partitions:
+        count_query = sql.SQL(
+            "SELECT EXISTS(SELECT 1 FROM {table} WHERE {col} >= %s AND {col} < %s LIMIT 1)"
+        ).format(
+            table=_table_identifier(partition),
+            col=sql.Identifier(order_by),
+        )
+        with conn.cursor() as cur:
+            cur.execute(count_query, (start, end))
+            row = cur.fetchone()
+            if row and row[0]:
+                partitions_with_data.append(partition)
+
+    return partitions_with_data
+
+
+def detach_and_drop_partition(conn: psycopg.Connection, parent: str, partition: str) -> None:
+    """Detach a partition and drop it natively."""
+    logger.info(f"Detaching partition {partition} from {parent}")
+    with conn.cursor() as cur:
+        cur.execute(
+            sql.SQL("ALTER TABLE {parent} DETACH PARTITION {child}").format(
+                parent=_table_identifier(parent), child=_table_identifier(partition)
+            )
+        )
+        cur.execute(sql.SQL("DROP TABLE {child}").format(child=_table_identifier(partition)))
+    conn.commit()
+    logger.info(f"Partition {partition} successfully detached and dropped.")
+
+
 def delete_chunk_with_verification(
-    conn: Any,
+    conn: psycopg.Connection,
     table: str,
     expected_sha256: str,
     s3_bucket: str,
@@ -340,29 +486,53 @@ def delete_chunk_with_verification(
     start: dt.datetime,
     end: dt.datetime,
     order_by: str,
-    config: BackparqConfig,  # BackparqConfig for batch_size
-) -> bool:
-    """Delete chunk after verifying S3 backup exists and matches checksum."""
-    from backparq.s3 import s3_verify_object_sha256
+    config: BackparqConfig,
+    watermark_id: Any = None,
+) -> int:
+    """Delete chunk after verifying S3 backup exists and matches checksum.
+
+    Returns:
+        Number of rows deleted. Returns -1 if S3 verification failed.
+    """
+    from backparq.storage.s3 import verify_checksum as s3_verify_object_sha256
 
     logger.info(f"Pre-delete verification for {table} [{start.strftime('%Y-%m')}]")
 
     if not s3_verify_object_sha256(s3_client, s3_bucket, s3_key, expected_sha256):
         logger.error(f"S3 verification failed for {s3_key}. Data NOT deleted.")
-        return False
+        return -1
 
-    db_row_count = pg_count_rows(conn, table, start, end, order_by)
-    if db_row_count == 0:
-        logger.info("No rows to delete")
-        return True
+    # Get Primary Key from config
+    table_config = config.archive.get_table_config(table)
+    primary_key = table_config.primary_key
 
-    batch_size = getattr(config.archive, "delete_batch_size", 10000)
-    deleted = delete_chunk_safely(conn, table, start, end, batch_size, order_by)
+    # Proceed based on offload strategy
+    offload_strategy = getattr(config.archive, "offload_strategy", "delete")
 
-    if deleted != db_row_count:
-        logger.warning(f"Deleted {deleted} rows but expected {db_row_count}")
+    if offload_strategy == "detach":
+        partitions = pg_get_partitions_in_range(conn, table, start, end, order_by)
+        if not partitions:
+            logger.info(f"No partitions found for {table} in time range, skipping detach.")
+            return 0
+        else:
+            for part in partitions:
+                detach_and_drop_partition(conn, table, part)
+            return 0  # Rows are dropped with the partition, count unknown
+    else:
+        batch_size = getattr(config.archive, "delete_batch_size", 10000)
 
-    return True
+        rows_deleted = delete_chunk_safely(
+            conn=conn,
+            table=table,
+            start=start,
+            end=end,
+            batch_size=batch_size,
+            order_by=order_by,
+            watermark_id=watermark_id,
+            primary_key=primary_key,
+        )
+
+        return rows_deleted
 
 
 def _serialize_for_postgres(value: Any) -> Any:
@@ -386,7 +556,7 @@ def _serialize_for_postgres(value: Any) -> Any:
 
 
 def insert_arrow_table_to_pg(
-    conn: Any,
+    conn: psycopg.Connection,
     table: str,
     arrow_table: Any,
     conflict_mode: str = "do_nothing",
@@ -395,16 +565,6 @@ def insert_arrow_table_to_pg(
 ) -> int:
     """
     Insert Arrow table data into PostgreSQL using COPY for efficiency.
-
-    Supports two conflict modes:
-    - "do_nothing": Skip rows with conflicting primary keys
-    - "upsert": Update existing rows with new values
-
-    Uses a staging table pattern for atomic upserts.
-    Uses pyarrow.csv for fast serialization of primitive types, falling back
-    to Python serialization for complex types (arrays, JSON).
-
-    Returns the number of rows inserted/updated.
     """
     import csv
     import io
@@ -423,11 +583,6 @@ def insert_arrow_table_to_pg(
             has_complex_types = True
             break
 
-    if has_complex_types:
-        logger.debug("Schema contains complex types; using slow serialization path")
-    else:
-        logger.debug("Schema contains only primitive types; using fast serialization path")
-
     total_inserted = 0
     columns = arrow_table.column_names
     cols_quoted = [sql.Identifier(c) for c in columns]
@@ -443,22 +598,12 @@ def insert_arrow_table_to_pg(
             # FAST PATH: Use pyarrow.csv
             import pyarrow.csv as pacsv
 
-            # Configure pyarrow to write CSV compatible with Postgres COPY (FORMAT CSV)
-            # - No header
-            # - Tab delimiter (to match our COPY command)
-            # - Quote '"' (default)
-            # - Escape '"' (default)
-            # - Nulls as empty string (default)
             write_options = pacsv.WriteOptions(
                 include_header=False, delimiter="\t", quoting_style="needed"
             )
             pacsv.write_csv(batch, buf, write_options=write_options)
-
-            # pyarrow writes binary utf-8, perfect for BytesIO
-
         else:
             # SLOW PATH: Manual serialization
-            # We must use StringIO for csv module
             text_buf = io.StringIO()
             writer = csv.writer(text_buf, delimiter="\t", quoting=csv.QUOTE_MINIMAL, quotechar='"')
 
@@ -467,7 +612,6 @@ def insert_arrow_table_to_pg(
                 csv_row = [_serialize_for_postgres(row[c]) for c in columns]
                 writer.writerow(csv_row)
 
-            # Encode to bytes for copy_expert
             text_buf.seek(0)
             buf.write(text_buf.getvalue().encode("utf-8"))
 
@@ -484,15 +628,17 @@ def insert_arrow_table_to_pg(
             cur.execute(create_stage)
 
             # COPY data into staging table
-            # We use FORMAT CSV to strictly handle quoting
             copy_sql = sql.SQL(
                 "COPY {stage} ({cols}) FROM STDIN WITH (FORMAT CSV, DELIMITER E'\\t', QUOTE '\"', NULL '')"
             ).format(stage=stage_ident, cols=cols_str)
 
-            cur.copy_expert(copy_sql.as_string(conn), buf)
+            # psycopg3 copy interface
+            with cur.copy(copy_sql) as copy:
+                copy.write(buf.getvalue())
 
             # Build INSERT/UPSERT query
             pk_ident = sql.Identifier(primary_key)
+            on_conflict: sql.Composable
             if conflict_mode == "upsert":
                 set_clause = sql.SQL(", ").join(
                     sql.SQL("{col} = EXCLUDED.{col}").format(col=sql.Identifier(c))
@@ -527,7 +673,7 @@ def insert_arrow_table_to_pg(
     return total_inserted
 
 
-def vacuum_table(config: DatabaseConfig, table: str) -> None:
+def vacuum_table(conn: psycopg.Connection, table: str) -> None:
     """
     Run VACUUM ANALYZE on a table to reclaim storage.
 
@@ -535,43 +681,12 @@ def vacuum_table(config: DatabaseConfig, table: str) -> None:
     """
     logger.info(f"Vacuuming table {table}...")
 
-    # Create a fresh connection specifically for VACUUM
-    # We don't reuse the existing connection because we need autocommit=True
-    # and we don't want to mess with the main connection's state.
-    conn = psycopg2.connect(config.dsn())
+    # Assumes conn is already autocommit if needed, or we must ensure it.
+    # Caller should handle connection state.
     try:
-        conn.autocommit = True
         with conn.cursor() as cur:
             query = sql.SQL("VACUUM ANALYZE {table}").format(table=_table_identifier(table))
             cur.execute(query)
         logger.info(f"Vacuum complete for {table}")
     except Exception as e:
         logger.error(f"Vacuum failed for {table}: {e}")
-        # Don't raise, just log error as this is maintenance
-    finally:
-        conn.close()
-
-
-def _apply_masking(rows: list[dict], masking: dict[str, str]) -> None:
-    """Apply masking rules to a batch of rows in-place."""
-    import hashlib
-
-    for row in rows:
-        for col, rule in masking.items():
-            if col not in row or row[col] is None:
-                continue
-
-            val = str(row[col])
-
-            if rule == "hash":
-                # SHA256 hash
-                row[col] = hashlib.sha256(val.encode("utf-8")).hexdigest()
-            elif rule == "redact":
-                # Fixed string
-                row[col] = "***REDACTED***"
-            elif rule == "partial":
-                # Show last 4 chars
-                if len(val) > 4:
-                    row[col] = "*" * (len(val) - 4) + val[-4:]
-                else:
-                    row[col] = val

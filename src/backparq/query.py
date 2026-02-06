@@ -19,6 +19,7 @@ logger = logging.getLogger(__name__)
 
 
 def _setup_duckdb(config: BackparqConfig) -> Optional[duckdb.DuckDBPyConnection]:
+    """Initialize a DuckDB connection with S3 credentials configured."""
     if not duckdb:
         print_error("DuckDB not installed. Run 'pip install backparq[query]' to use this feature.")
         return None
@@ -26,45 +27,28 @@ def _setup_duckdb(config: BackparqConfig) -> Optional[duckdb.DuckDBPyConnection]
     try:
         con = duckdb.connect(database=":memory:")
 
-        # Install/Load httpfs for S3 support
         con.execute("INSTALL httpfs;")
         con.execute("LOAD httpfs;")
 
-        # Configure S3 credentials
         if config.s3.bucket:
-            # Use region if available
-            region_config = f"SET s3_region='{config.s3.region}';" if config.s3.region else ""
+            if config.s3.region:
+                con.execute(f"SET s3_region='{config.s3.region}';")
 
-            # Credentials (prefer env vars, but explicit set for DuckDB session)
-            creds_config = ""
             if config.s3.access_key_id and config.s3.secret_access_key:
-                creds_config = f"""
-                    SET s3_access_key_id='{config.s3.access_key_id}';
-                    SET s3_secret_access_key='{config.s3.secret_access_key}';
-                """
-            if config.s3.session_token:
-                creds_config += f"SET s3_session_token='{config.s3.session_token}';"
+                con.execute(f"SET s3_access_key_id='{config.s3.access_key_id}';")
+                con.execute(f"SET s3_secret_access_key='{config.s3.secret_access_key}';")
 
-            # Endpoint for MinIO/custom S3
-            endpoint_config = ""
+            if config.s3.session_token:
+                con.execute(f"SET s3_session_token='{config.s3.session_token}';")
+
             if config.s3.endpoint_url:
                 endpoint = config.s3.endpoint_url.replace("https://", "").replace("http://", "")
-                endpoint_config = f"SET s3_endpoint='{endpoint}';"
+                con.execute(f"SET s3_endpoint='{endpoint}';")
                 if not config.s3.use_ssl:
-                    endpoint_config += "SET s3_use_ssl=false;"
+                    con.execute("SET s3_use_ssl=false;")
 
-            style_config = ""
             if config.s3.addressing_style:
-                style_config = f"SET s3_url_style='{config.s3.addressing_style}';"
-
-            setup_sql = f"""
-                {region_config}
-                {creds_config}
-                {endpoint_config}
-                {style_config}
-            """
-            console.print(f"[dim]Debug Setup SQL:\n{setup_sql}[/dim]")
-            con.execute(setup_sql)
+                con.execute(f"SET s3_url_style='{config.s3.addressing_style}';")
 
         return con
     except Exception as e:
@@ -72,48 +56,37 @@ def _setup_duckdb(config: BackparqConfig) -> Optional[duckdb.DuckDBPyConnection]
         return None
 
 
-def run_query(config: BackparqConfig, sql: str) -> None:
-    """
-    Execute SQL query against S3 archives.
+def run_query(config: BackparqConfig, sql_query: str) -> None:
+    """Execute SQL query against S3 archives.
 
-    Auto-registers tables in the config as views.
-    View name = table name (safe).
+    Auto-registers tables in the config as DuckDB views.
+    View name = table name with dots replaced by underscores.
     """
     con = _setup_duckdb(config)
     if not con:
         sys.exit(1)
 
-    # Auto-register views for configured tables
     if config.s3.bucket:
         base_s3 = f"s3://{config.s3.bucket}/{config.s3.prefix}/archive"
 
         for table in config.archive.tables:
-            # Handle schema.table -> schema_table
-            valid_view_name = table.name.replace(".", "_")
-            # Glob pattern for all parquet files
-            s3_glob = f"{base_s3}/{table.name.replace('.', '_')}/**/*.parquet"
-
-            console.print(f"[dim]Debug Glob: {s3_glob}[/dim]")
+            view_name = table.name.replace(".", "_")
+            s3_glob = f"{base_s3}/{view_name}/**/*.parquet"
 
             try:
                 con.execute(
-                    f"CREATE OR REPLACE VIEW {valid_view_name} AS SELECT * FROM read_parquet('{s3_glob}');"
+                    f"CREATE OR REPLACE VIEW {view_name} AS "
+                    f"SELECT * FROM read_parquet('{s3_glob}');"
                 )
-                logger.debug(f"Registered view {valid_view_name} -> {s3_glob}")
+                logger.debug(f"Registered view {view_name} -> {s3_glob}")
             except Exception as e:
                 logger.warning(f"Could not register view for {table.name}: {e}")
-    else:
-        # Local mode (less common for this command but good for consistency)
-        pass
 
-    console.print(f"[bold]Executing:[/bold] {sql}")
+    console.print(f"[bold]Executing:[/bold] {sql_query}")
     console.print()
 
     try:
-        # Run query and stream result to console
-        # fetchdf() is good for display with rich/pandas, but simple fetchall is safer dep-wise
-        # Let's try to use Rich table if we can, or just print
-        result = con.execute(sql).fetchall()
+        result = con.execute(sql_query).fetchall()
         columns = [desc[0] for desc in con.description]
 
         from rich.table import Table as RichTable

@@ -36,17 +36,43 @@ class DatabaseConfig:
     sslmode: str = ""
     connect_timeout: int = 10
 
+    @staticmethod
+    def _quote_libpq(value: str) -> str:
+        """Quote a libpq connection string value if it contains special chars."""
+        if not value or any(c in value for c in (" ", "'", "\\", "=")):
+            escaped = value.replace("\\", "\\\\").replace("'", "\\'")
+            return f"'{escaped}'"
+        return value
+
     def dsn(self) -> str:
         parts = [
-            f"host={self.host}",
+            f"host={self._quote_libpq(self.host)}",
             f"port={self.port}",
-            f"dbname={self.name}",
-            f"user={self.user}",
-            f"password={self.password}",
+            f"dbname={self._quote_libpq(self.name)}",
+            f"user={self._quote_libpq(self.user)}",
+            f"password={self._quote_libpq(self.password)}",
             f"connect_timeout={self.connect_timeout}",
         ]
         if self.sslmode:
-            parts.append(f"sslmode={self.sslmode}")
+            parts.append(f"sslmode={self._quote_libpq(self.sslmode)}")
+        return " ".join(parts)
+
+    def duckdb_dsn(self) -> str:
+        """Build a DSN string safe for DuckDB postgres_scanner.
+
+        DuckDB's postgres extension uses libpq under the hood, so we build
+        a clean libpq connection string from individual components, avoiding
+        any fragile string manipulation of existing DSN strings.
+        """
+        parts = [
+            f"host={self._quote_libpq(self.host)}",
+            f"port={self.port}",
+            f"dbname={self._quote_libpq(self.name)}",
+            f"user={self._quote_libpq(self.user)}",
+            f"password={self._quote_libpq(self.password)}",
+        ]
+        if self.sslmode:
+            parts.append(f"sslmode={self._quote_libpq(self.sslmode)}")
         return " ".join(parts)
 
 
@@ -107,6 +133,7 @@ class TableConfig:
 
     name: str
     primary_key: str = DEFAULT_PRIMARY_KEY
+    order_by: str = DEFAULT_ORDER_BY
     masking: dict[str, str] = field(default_factory=dict)
 
     def __str__(self) -> str:
@@ -125,10 +152,12 @@ class ArchiveConfig:
     overwrite: bool = False
     dry_run: bool = False
     perform_delete: bool = False
+    offload_strategy: str = "delete"
     delete_batch_size: int = 10_000
     order_by: str = DEFAULT_ORDER_BY
     concurrency: int = 1
     chunk_concurrency: int = 1
+    chunk_rows: int = 500_000
     vacuum: bool = False
     retention: RetentionConfig = field(default_factory=RetentionConfig)
 
@@ -394,9 +423,15 @@ def _parse_tables(tables_data: list) -> list[TableConfig]:
             if not isinstance(table_name, str) or not table_name.strip():
                 raise ConfigError("Table config must have 'table' or 'name' key with string value.")
             pk = _optional_str(item, "primary_key", DEFAULT_PRIMARY_KEY)
+            order_by = _optional_str(item, "order_by", DEFAULT_ORDER_BY)
             masking = _optional_str_map(item, "masking")
             parsed_tables.append(
-                TableConfig(name=table_name.strip(), primary_key=pk, masking=masking)
+                TableConfig(
+                    name=table_name.strip(),
+                    primary_key=pk,
+                    order_by=order_by,
+                    masking=masking,
+                )
             )
         else:
             raise ConfigError(f"Invalid table entry: {item}. Must be string or dict.")
@@ -435,10 +470,12 @@ def _parse_archive(data: dict[str, Any]) -> ArchiveConfig:
         overwrite=_optional_bool(data, "overwrite", False),
         dry_run=_optional_bool(data, "dry_run", False),
         perform_delete=_optional_bool(data, "perform_delete", False),
+        offload_strategy=_optional_str(data, "offload_strategy", "delete").lower(),
         delete_batch_size=_optional_int(data, "delete_batch_size", 10_000),
         order_by=_optional_str(data, "order_by", DEFAULT_ORDER_BY),
         concurrency=_optional_int(data, "concurrency", 1),
         chunk_concurrency=_optional_int(data, "chunk_concurrency", 1),
+        chunk_rows=_optional_int(data, "chunk_rows", 500_000),
         vacuum=_optional_bool(data, "vacuum", False),
         retention=_parse_retention(data.get("retention", {})),
     )

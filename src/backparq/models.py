@@ -1,19 +1,18 @@
 from __future__ import annotations
 
 import datetime as dt
+import threading
 from dataclasses import dataclass, field
 
 
 @dataclass
 class ArchiveResult:
-    """Result of an archive operation."""
-
     tables_processed: int = 0
-    chunks_archived: int = 0
-    rows_archived: int = 0
-    bytes_uploaded: int = 0
+    total_rows_exported: int = 0
+    total_rows_deleted: int = 0
     duration_seconds: float = 0.0
     errors: list[str] = field(default_factory=list)
+    _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
     @property
     def success(self) -> bool:
@@ -22,17 +21,39 @@ class ArchiveResult:
     @property
     def rows_per_second(self) -> float:
         if self.duration_seconds > 0:
-            return self.rows_archived / self.duration_seconds
+            return self.total_rows_exported / self.duration_seconds
         return 0.0
 
     def to_dict(self) -> dict:
         return {
             "tables_processed": self.tables_processed,
-            "chunks_archived": self.chunks_archived,
-            "rows_archived": self.rows_archived,
-            "bytes_uploaded": self.bytes_uploaded,
+            "total_rows_exported": self.total_rows_exported,
+            "total_rows_deleted": self.total_rows_deleted,
             "duration_seconds": round(self.duration_seconds, 2),
             "throughput_rows_per_sec": round(self.rows_per_second, 1),
+            "success": self.success,
+            "errors": self.errors,
+        }
+
+
+@dataclass
+class RestoreResult:
+    tables_processed: int = 0
+    chunks_restored: int = 0
+    rows_restored: int = 0
+    duration_seconds: float = 0.0
+    errors: list[str] = field(default_factory=list)
+
+    @property
+    def success(self) -> bool:
+        return len(self.errors) == 0
+
+    def to_dict(self) -> dict:
+        return {
+            "tables_processed": self.tables_processed,
+            "chunks_restored": self.chunks_restored,
+            "rows_restored": self.rows_restored,
+            "duration_seconds": round(self.duration_seconds, 2),
             "success": self.success,
             "errors": self.errors,
         }
@@ -65,8 +86,6 @@ class VerifyResult:
 
 @dataclass
 class TableProgress:
-    """Progress tracking for a single table."""
-
     status: str = "pending"
     chunks_total: int = 0
     chunks_complete: int = 0
@@ -85,8 +104,6 @@ class TableProgress:
 
 @dataclass
 class RunProgress:
-    """Progress tracking for entire archive run."""
-
     run_id: str
     started_at: dt.datetime
     tables: dict[str, TableProgress] = field(default_factory=dict)

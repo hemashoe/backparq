@@ -5,15 +5,16 @@ from sqlalchemy import create_engine, text
 from testcontainers.minio import MinioContainer
 from testcontainers.postgres import PostgresContainer
 
-from backparq.archive import archive_tables
+from backparq.pipeline import archive_tables
 from backparq.config import (
     ArchiveConfig,
     BackparqConfig,
     DatabaseConfig,
     ParquetConfig,
     S3Config,
+    TableConfig,
 )
-from backparq.restore import restore_tables
+from backparq.pipeline import restore_tables
 
 # Skip if docker not available or libs missing
 try:
@@ -42,9 +43,9 @@ def db_config(postgres):
     return DatabaseConfig(
         host=postgres.get_container_host_ip(),
         port=postgres.get_exposed_port(5432),
-        name=postgres.POSTGRES_DB,
-        user=postgres.POSTGRES_USER,
-        password=postgres.POSTGRES_PASSWORD,
+        name=postgres.dbname,
+        user=postgres.username,
+        password=postgres.password,
         sslmode="disable",
     )
 
@@ -100,7 +101,8 @@ def test_archive_and_restore(postgres, db_config, s3_config, tmp_path):
         s3=s3_config,
         parquet=ParquetConfig(encryption=ParquetEncryptionConfig(enabled=False)),
         archive=ArchiveConfig(
-            tables=["test_events"],
+            tables=[TableConfig(name="test_events")],
+            mode="offload",
             cutoff_exclusive=dt.datetime(
                 2023, 2, 1, tzinfo=dt.timezone.utc
             ),  # Archive Jan, keep Feb
@@ -130,8 +132,8 @@ def test_archive_and_restore(postgres, db_config, s3_config, tmp_path):
     # 5. Run Restore
     restore_tables(
         config=config,
-        start_date=dt.datetime(2023, 1, 1, tzinfo=dt.timezone.utc),
-        end_date=dt.datetime(2023, 2, 1, tzinfo=dt.timezone.utc),
+        start=dt.datetime(2023, 1, 1, tzinfo=dt.timezone.utc),
+        end=dt.datetime(2023, 2, 1, tzinfo=dt.timezone.utc),
         conflict_mode="do_nothing",
     )
 

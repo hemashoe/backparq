@@ -6,8 +6,9 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from typing import Any, Optional
 
-import psycopg2
-from psycopg2 import pool
+import psycopg
+from psycopg import sql
+from psycopg_pool import ConnectionPool as PsycopgPool
 from tenacity import retry, stop_after_attempt, wait_exponential
 
 from backparq.config import DatabaseConfig
@@ -16,11 +17,12 @@ logger = logging.getLogger(__name__)
 
 
 @retry(stop=stop_after_attempt(5), wait=wait_exponential(multiplier=1, min=2, max=30))
-def connect(config: DatabaseConfig) -> psycopg2.extensions.connection:
+def connect(config: DatabaseConfig) -> psycopg.Connection:
     """Create a PostgreSQL connection with retry logic."""
     logger.debug(f"Connecting to {config.host}:{config.port}/{config.name}")
-    conn = psycopg2.connect(config.dsn())
-    conn.autocommit = False
+    # psycopg3 uses conninfo string or kwargs.
+    # config.dsn() likely returns a libpq-style string which psycopg3 supports.
+    conn = psycopg.connect(config.dsn(), autocommit=False)
     return conn
 
 
@@ -37,61 +39,79 @@ def test_connection(config: DatabaseConfig) -> None:
 
 
 class ConnectionPool:
-    """Thread-safe connection pool."""
+    """Thread-safe connection pool using psycopg_pool."""
 
     def __init__(self, config: DatabaseConfig, minconn: int = 2, maxconn: int = 10):
         self.config = config
         self.minconn = minconn
         self.maxconn = maxconn
-        self._pool: Optional[pool.ThreadedConnectionPool] = None
+        self._pool: Optional[PsycopgPool] = None
         self._lock = threading.Lock()
 
-    def _ensure_pool(self) -> pool.ThreadedConnectionPool:
+    def _ensure_pool(self) -> PsycopgPool:
         if self._pool is None:
             with self._lock:
                 if self._pool is None:
                     logger.info(f"Creating pool: min={self.minconn}, max={self.maxconn}")
-                    self._pool = pool.ThreadedConnectionPool(
-                        self.minconn,
-                        self.maxconn,
-                        host=self.config.host,
-                        port=self.config.port,
-                        dbname=self.config.name,
-                        user=self.config.user,
-                        password=self.config.password,
-                        connect_timeout=self.config.connect_timeout,
+                    # psycopg_pool.ConnectionPool takes conninfo as first arg
+                    self._pool = PsycopgPool(
+                        self.config.dsn(),
+                        min_size=self.minconn,
+                        max_size=self.maxconn,
+                        timeout=self.config.connect_timeout,
+                        open=True,  # Open immediately
                     )
         return self._pool
 
     @contextmanager
-    def connection(self) -> Iterator[psycopg2.extensions.connection]:
-        p = self._ensure_pool()
-        conn = p.getconn()
-        try:
-            yield conn
-            conn.commit()
-        except Exception:
-            conn.rollback()
-            raise
-        finally:
-            p.putconn(conn)
+    def connection(self, snapshot_id: Optional[str] = None) -> Iterator[psycopg.Connection]:
+        """
+        Get a connection from the pool.
+
+        Args:
+            snapshot_id: Optional PostgreSQL snapshot ID to synchronize transaction view.
+                         Requires Repeatable Read isolation.
+        """
+        pool = self._ensure_pool()
+        with pool.connection() as conn:
+            try:
+                if snapshot_id:
+                    # Snapshot sharing allows workers to see the exact same DB state
+                    conn.isolation_level = psycopg.IsolationLevel.REPEATABLE_READ
+
+                    # Explicitly start the transaction with the snapshot
+                    # We use a transaction block to ensure commit/rollback
+                    with conn.transaction():
+                        query = sql.SQL("SET TRANSACTION SNAPSHOT {}").format(
+                            sql.Literal(snapshot_id)
+                        )
+                        conn.execute(query)
+                        yield conn
+                else:
+                    # Standard Read Committed transaction
+                    conn.isolation_level = psycopg.IsolationLevel.READ_COMMITTED
+                    # We simulate the same behavior: yield conn, then commit
+                    yield conn
+                    conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
 
     @contextmanager
-    def autocommit_connection(self) -> Iterator[psycopg2.extensions.connection]:
+    def autocommit_connection(self) -> Iterator[psycopg.Connection]:
         """Connection with autocommit for DDL operations like VACUUM."""
-        p = self._ensure_pool()
-        conn = p.getconn()
-        old = conn.autocommit
-        try:
-            conn.autocommit = True
-            yield conn
-        finally:
-            conn.autocommit = old
-            p.putconn(conn)
+        pool = self._ensure_pool()
+        with pool.connection() as conn:
+            old = conn.autocommit
+            try:
+                conn.autocommit = True
+                yield conn
+            finally:
+                conn.autocommit = old
 
     def close(self) -> None:
         if self._pool:
-            self._pool.closeall()
+            self._pool.close()
             self._pool = None
             logger.info("Pool closed")
 

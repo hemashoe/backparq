@@ -44,3 +44,7 @@ uv run mypy src/
 5. Open a pull request
 
 Look for issues labeled `good first issue` or `help wanted`.
+
+## Code of Conduct
+
+Please note that this project is released with a [Code of Conduct](CODE_OF_CONDUCT.md). By participating in this project you agree to abide by its terms.

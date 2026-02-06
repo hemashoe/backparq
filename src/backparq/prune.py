@@ -1,8 +1,13 @@
+"""Retention-based pruning of old backups from S3."""
+
 from __future__ import annotations
 
 import datetime as dt
 import logging
-from typing import TypedDict
+from typing import TYPE_CHECKING, TypedDict
+
+if TYPE_CHECKING:
+    from backparq.adapters.catalog import Catalog
 
 from rich.table import Table
 
@@ -31,6 +36,10 @@ class PruneResult(TypedDict):
 
 
 def prune_backups(config: BackparqConfig, dry_run: bool = False) -> PruneResult:
+    """Delete backups older than the configured retention period.
+
+    Updates the catalog (if available) to mark pruned chunks as PRUNED.
+    """
     result: PruneResult = {"deleted": [], "summary": {"files_deleted": 0, "bytes_freed": 0}}
 
     if not config.archive.retention.enabled:
@@ -53,6 +62,14 @@ def prune_backups(config: BackparqConfig, dry_run: bool = False) -> PruneResult:
 
     console.print(f"Cutoff: {cutoff.strftime('%Y-%m-%d')}")
     console.print()
+
+    # Load catalog if available
+    catalog = None
+    catalog_path = config.archive.base_dir / "backparq.db"
+    if catalog_path.exists():
+        from backparq.adapters.catalog import Catalog
+
+        catalog = Catalog(catalog_path)
 
     to_delete = []
     paginator = s3.get_paginator("list_objects_v2")
@@ -105,17 +122,38 @@ def prune_backups(config: BackparqConfig, dry_run: bool = False) -> PruneResult:
                 result["deleted"].append(item["key"])
                 result["summary"]["files_deleted"] += 1
                 result["summary"]["bytes_freed"] += item["size"]
+
+                # Update catalog if available
+                if catalog:
+                    _mark_pruned_in_catalog(catalog, item["key"])
             except Exception as e:
                 logger.error(f"Delete failed {item['key']}: {e}")
             progress.advance(task)
 
     print_success(
-        f"Deleted {result['summary']['files_deleted']} files ({format_size(result['summary']['bytes_freed'])})"
+        f"Deleted {result['summary']['files_deleted']} files "
+        f"({format_size(result['summary']['bytes_freed'])})"
     )
     return result
 
 
+def _mark_pruned_in_catalog(catalog: Catalog, s3_key: str) -> None:
+    """Try to find and mark the chunk as pruned in the catalog."""
+    try:
+        chunks = catalog.list_chunks()
+        for chunk_data in chunks:
+            if chunk_data.get("s3_key") == s3_key:
+                from backparq.adapters.catalog import ChunkState
+
+                catalog.transition(chunk_data["id"], ChunkState.PRUNED)
+                logger.debug(f"Marked {chunk_data['id']} as PRUNED in catalog")
+                break
+    except Exception as e:
+        logger.debug(f"Could not update catalog for {s3_key}: {e}")
+
+
 def _parse_year_month(key: str) -> tuple[int, int]:
+    """Extract year and month from S3 key path segments."""
     year = month = 0
     for p in key.split("/"):
         if p.startswith("year="):

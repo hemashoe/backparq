@@ -31,7 +31,7 @@ class ChecksumError(BackparqError):
     pass
 
 
-class ConnectionError(BackparqError):
+class BackparqConnectionError(BackparqError):
     """Database or S3 connection failed."""
 
     pass

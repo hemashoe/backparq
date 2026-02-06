@@ -1,200 +1,150 @@
 # Backparq
 
-**Table-level PostgreSQL Backup to Parquet on S3.**
+**Turn your PostgreSQL backups into a queryable Data Lake.**
 
-Backparq exports PostgreSQL tables as Parquet files to S3, enabling fast restores, columnar analytics, and long-term retention at a fraction of the cost of keeping data in your database.
+Backparq is a specialized tool with a singular mission: **bridge the gap between transactional databases and analytical storage.**
+
+Unlike traditional backup tools that lock data into opaque binary formats, Backparq exports your tables as **Parquet files on S3**. This means your backups aren't just an insurance policy—they are an accessible, queryable asset.
 
 [![CI](https://github.com/hemashoe/backparq/actions/workflows/ci.yml/badge.svg)](https://github.com/hemashoe/backparq/actions/workflows/ci.yml)
 [![Python 3.8+](https://img.shields.io/badge/python-3.8%2B-blue.svg)](https://www.python.org/)
 [![PyPI](https://img.shields.io/pypi/v/backparq.svg)](https://pypi.org/project/backparq/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-## Why Backparq?
+See [CONTRIBUTING.md](CONTRIBUTING.md).
 
-| Problem | How Backparq Solves It |
-|---------|------------------------|
-| **Database growing too large** | Archive old data to S3, optionally delete from PostgreSQL |
-| **Need table-level backups** | Full or incremental snapshots per table, not whole database |
-| **Want to query historical data** | Parquet format works with DuckDB, Athena, Spark, Pandas |
-| **Slow restores from pg_dump** | Restore specific tables and date ranges in minutes |
-| **No visibility into backups** | SHA256 checksums, verification commands, progress bars |
+## Code of Conduct
+Please note that this project is released with a [Code of Conduct](CODE_OF_CONDUCT.md). By participating in this project you agree to abide by its terms.
 
-## Backparq vs WAL-G vs pg_dump
+## Mission
 
-| | **pg_dump** | **WAL-G** | **Backparq** |
-|---|-------------|-----------|--------------|
-| **Backup Scope** | Full database | Full database (WAL + base) | Per-table, selectable |
-| **Backup Format** | SQL / custom binary | WAL segments + base backup | Parquet (columnar) |
-| **Incremental** | No | Yes (WAL streaming) | Yes (by date ranges) |
-| **Restore Granularity** | Entire DB or single table | Point-in-time (whole DB) | Per-table + date range |
-| **Query Backups Directly** | No | No | Yes (DuckDB/Athena/Spark) |
-| **Storage Efficiency** | Low (uncompressed SQL) | Medium | High (columnar + zstd) |
-| **S3 Native** | Via pipe/script | Yes | Yes |
-| **Use Case** | Migrations, full dumps | Continuous DR, PITR | Table archival, analytics-ready backups |
+Backparq makes backups useful immediately, not just in emergencies.
 
-### When to Use Each
+- **Don't just store it, query it**: Use DuckDB, Athena, Spark, or Pandas to run analytics directly on your S3 archives without restoring them.
+- **Offload, don't just delete**: When the database grows too large, move historical data to cheap S3 storage while keeping it queryable.
+- **Surgical precision**: Restore exactly the tables and rows you need (e.g., "Users table from last Tuesday"), rather than rolling back the entire database.
 
-- **pg_dump**: One-off migrations, development snapshots, schema exports
-- **WAL-G**: Continuous disaster recovery, point-in-time recovery to any second
-- **Backparq**: Table-level backups, cold data archival, analytics on historical data
+## The Right Tool for the Job
 
-**Best practice**: Use WAL-G for continuous DR + Backparq for table-level archival and analytics.
+Backparq is **not** a replacement for WAL-G or pgBackRest. It is a complementary tool designed for different use cases.
+
+| Feature | **WAL-G / pgBackRest** | **Backparq** |
+|---------|-----------------------|--------------|
+| **Core Philosophy** | **Disaster Recovery** (The "Red Button") | **Data Portability & Archival** |
+| **Analogy** | A security camera recording (continuous video) | A professional photoshoot (high-quality snapshots) |
+| **Format** | Opaque binary (WAL segments) | **Open Standard (Parquet)** |
+| **Queryable?** | No (must restore DB first) | **Yes (directly on S3)** |
+| **Granularity** | Entire Database only | **Specific Tables / Date Ranges** |
+| **Best For** | Point-in-Time Recovery to a specific second | Analytics, Long-term Archival, Partial Restores |
+
+**The Perfect Setup:**
+1. Use **WAL-G** for your disaster recovery safety net (RPO ≈ 0).
+2. Use **Backparq** to offload historical data and create queryable snapshots for analytics.
 
 ## Features
 
-- **Two Modes**: Backup (full snapshots) or Offload (archive + delete old data)
-- **Table Selection**: Choose specific tables, not the entire database
-- **Date-Range Restore**: Restore only the data you need, not everything
-- **Columnar Format**: Query backups directly with DuckDB, Athena, or Spark
-- **Parallel Processing**: Concurrent table and chunk processing
-- **Streaming Export**: Constant memory usage regardless of table size
-- **Safety First**: SHA256 checksums verified before any deletion
-- **Encryption**: S3 SSE-S3, SSE-KMS, or client-side Parquet encryption
+- **Columnar Efficiency**: Parquet + Snappy/Zstd compression reduces storage costs significantly compared to raw SQL or CSV.
+- **Smart Offloading**: Archive data older than X days and optionally delete it from PostgreSQL to reclaim space.
+- **Safety First**: SHA256 checksums are verified for every single file before any data is deleted.
+- **Streaming & Parallel**: Uses server-side cursors and parallel uploads to handle varying table sizes efficiently without blowing up memory.
+- **Serverless Friendly**: Runs anywhere (Kubernetes cronjob, Lambda, EC2 micro) and talks directly to S3.
 
 ## Installation
 
 ```bash
-# Recommended: use uv
+# Recommended: use uv for fast, reliable management
 curl -LsSf https://astral.sh/uv/install.sh | sh
+
+# Install backparq
 uv pip install backparq
 
-# Or pip
-pip install backparq
-
-# With DuckDB for querying archives
+# With DuckDB for querying archives directly
 uv pip install backparq[query]
 ```
 
 ## Quick Start
 
 ```bash
-# 1. Generate config
+# 1. Initialize configuration
 backparq init
 
-# 2. Test connections
-backparq test --config backparq.yaml
-
-# 3. Run backup (preview)
+# 2. Dry run (see what would happen without touching data)
 backparq archive --config backparq.yaml --dry-run
 
-# 4. Run backup
+# 3. Seamless Offload (Archive + Delete from DB)
 backparq archive --config backparq.yaml --stats
 ```
 
-## Usage
+## Use Cases
 
-### Backup Tables
-
-Create full snapshots of specific tables:
-
-```bash
-backparq archive --config backup.yaml --stats
-```
-
-```yaml
-# backup.yaml
-archive:
-  mode: backup           # Full snapshot, no deletion
-  tables:
-    - public.users
-    - public.orders
-    - public.transactions
-```
-
-### Archive + Delete Old Data
-
-Move data older than 90 days to S3 and reclaim database space:
-
-```bash
-backparq archive --config offload.yaml --stats
-```
+### 1. The "Bottomless" Database (Offloading)
+Keep your primary PostgreSQL lean and fast by moving historical data to S3.
 
 ```yaml
 # offload.yaml
 archive:
   mode: offload
-  cutoff: "-90d"         # Archive data older than 90 days
-  perform_delete: true   # Delete after verified S3 upload
+  cutoff: "-1y"          # Move everything older than 1 year
+  perform_delete: true   # Delete from Postgres after safe upload
   tables:
+    - public.logs
+    - public.audit_trails
     - public.events
-    - public.audit_logs
 ```
 
-### Restore
+### 2. Analytics-Ready Snapshots
+Take nightly snapshots of critical tables for your data science team.
 
-```bash
-# Restore specific date range
-backparq restore --config restore.yaml \
-  --start 2024-01-01 --end 2024-03-01
-
-# Restore from a specific backup snapshot
-backparq restore --config restore.yaml \
-  --backup-id 2024-01-15_120000
-
-# Update existing rows with archived data
-backparq restore ... --conflict-mode upsert
+```yaml
+# backup.yaml
+archive:
+  mode: backup
+  tables:
+    - public.users
+    - public.transactions
+    - public.products
 ```
 
-### Query Archives Directly
+### 3. Surgical Restore
+Did someone accidentally delete rows from `users`? Restore just that table.
 
 ```bash
-# Query with DuckDB (requires backparq[query])
-backparq query --config backparq.yaml \
-  --sql "SELECT COUNT(*) FROM public_orders WHERE created_at > '2024-01-01'"
+backparq restore --config backparq.yaml \
+  --tables public.users \
+  --start 2024-01-01 --end 2024-01-02 \
+  --conflict-mode upsert
 ```
 
-### Verify & Maintain
+## Integrations
+
+Since Backparq uses standard Parquet, your backups integrate instantly with the modern data stack:
+
+- **DuckDB**: `SELECT * FROM 's3://bucket/*.parquet'`
+- **AWS Athena**: Create external tables on top of your backup prefixes.
+- **Spark / Databricks**: Native read support.
+- **Pandas**: `pd.read_parquet("s3://...")`
+
+## Scheduling
+
+Backparq is designed to run non-interactively, making it perfect for cron jobs.
+
+To run a backup every night at 3 AM:
 
 ```bash
-backparq check --config backparq.yaml   # List archives
-backparq verify --config backparq.yaml  # Verify checksums
-backparq prune --config backparq.yaml   # Delete old backups per retention
+# Open crontab
+crontab -e
+
+# Add line (ensure full paths or activate venv)
+0 3 * * * /path/to/venv/bin/backparq archive --config /path/to/backup.yaml --stats >> /var/log/backparq.log 2>&1
 ```
 
 ## Configuration
 
-```yaml
-database:
-  host: localhost
-  name: production_db
-  user: postgres
-  password: "${PG_PASSWORD}"
-
-s3:
-  bucket: my-backups
-  prefix: postgres
-  region: us-east-1
-  sse: "AES256"  # Server-side encryption
-
-archive:
-  mode: backup   # or "offload"
-  tables:
-    - table: public.orders
-      primary_key: order_id
-```
-
-See [`examples/reference.yaml`](examples/reference.yaml) for all options.
-
-## Example Configs
-
-| File | Use Case |
-|------|----------|
-| [`examples/backup.yaml`](examples/backup.yaml) | Full table snapshots for DR |
-| [`examples/offload.yaml`](examples/offload.yaml) | Archive old data + delete from DB |
-| [`examples/restore.yaml`](examples/restore.yaml) | Restore with date ranges |
-| [`examples/reference.yaml`](examples/reference.yaml) | All configuration options |
-
-## Security
-
-- **Credentials**: IAM roles, environment variables, or AWS credentials file
-- **Encryption at rest**: S3 SSE-S3, SSE-KMS, or client-side Parquet encryption
-- **Encryption in transit**: HTTPS to S3
-- **Checksums**: SHA256 verification before any deletion
-
-See [SECURITY.md](SECURITY.md) for vulnerability reporting.
+See [`examples/reference.yaml`](examples/reference.yaml) for the complete configuration reference, including encryption, compression settings, and concurrency tuning.
 
 ## Contributing
 
+Contributions are welcome! Please use `uv` for development:
 ```bash
 uv venv && source .venv/bin/activate
 uv pip install -e ".[dev]"

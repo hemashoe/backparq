@@ -1,4 +1,4 @@
-"""Backup listing."""
+"""Backup listing and inventory."""
 
 from __future__ import annotations
 
@@ -24,6 +24,7 @@ logger = logging.getLogger(__name__)
 
 
 def check_backups(config: BackparqConfig, output_json: bool = False) -> dict:
+    """List and summarize backups in S3."""
     result: dict[str, Any] = {"backups": [], "summary": {}}
 
     if not config.s3.bucket:
@@ -114,6 +115,15 @@ def check_backups(config: BackparqConfig, output_json: bool = False) -> dict:
 
 
 def _parse_backup_key(key: str, prefix: str) -> dict:
+    """Parse an S3 key into structured backup info.
+
+    The S3 key format is:
+        {prefix}/{mode}/{table_name}/year={Y}/month={M}/{filename}.parquet
+
+    The table name is extracted from the directory path (not the filename)
+    to avoid issues with underscores in table names being confused with
+    schema.table separators.
+    """
     info: dict[str, Any] = {"key": key, "table": None, "year": None, "month": None, "mode": None}
     path = key[len(prefix) :].lstrip("/")
     parts = path.split("/")
@@ -135,9 +145,15 @@ def _parse_backup_key(key: str, prefix: str) -> dict:
             except (ValueError, IndexError):
                 pass
 
-    filename = parts[-1] if parts else ""
-    if filename.endswith(".parquet"):
-        name = filename.rsplit("_", 1)[0]
-        info["table"] = name.replace("_", ".", 1) if "_" in name else name
+    # Extract table name from directory structure, not filename.
+    # Path format: {mode}/{table_name}/year=.../month=.../file.parquet
+    # The table directory is the segment after the mode directory.
+    mode_dirs = ("archive", "backups")
+    for i, part in enumerate(parts):
+        if part in mode_dirs and i + 1 < len(parts):
+            candidate = parts[i + 1]
+            if not candidate.startswith("year=") and not candidate.startswith("month="):
+                info["table"] = candidate
+                break
 
     return info
