@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import logging
 import sys
-from typing import Optional
+from pathlib import Path
+from typing import Any, Optional
 
 try:
     import duckdb
@@ -115,16 +116,16 @@ def run_query(config: BackparqConfig, sql: str) -> None:
         result = con.execute(sql).fetchall()
         columns = [desc[0] for desc in con.description]
 
-        from rich.table import Table
+        from rich.table import Table as RichTable
 
-        table = Table(show_header=True, header_style="bold magenta")
+        output_table = RichTable(show_header=True, header_style="bold magenta")
         for col in columns:
-            table.add_column(col)
+            output_table.add_column(col)
 
         for row in result:
-            table.add_row(*[str(x) for x in row])
+            output_table.add_row(*[str(x) for x in row])
 
-        console.print(table)
+        console.print(output_table)
         console.print(f"\n[dim]Returned {len(result)} rows[/dim]")
 
     except Exception as e:

@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 from collections import defaultdict
+from typing import Any
 
 from rich.table import Table
 
@@ -23,7 +24,7 @@ logger = logging.getLogger(__name__)
 
 
 def check_backups(config: BackparqConfig, output_json: bool = False) -> dict:
-    result = {"backups": [], "summary": {}}
+    result: dict[str, Any] = {"backups": [], "summary": {}}
 
     if not config.s3.bucket:
         print_warning("No S3 bucket configured")
@@ -113,7 +114,7 @@ def check_backups(config: BackparqConfig, output_json: bool = False) -> dict:
 
 
 def _parse_backup_key(key: str, prefix: str) -> dict:
-    info = {"key": key, "table": None, "year": None, "month": None, "mode": None}
+    info: dict[str, Any] = {"key": key, "table": None, "year": None, "month": None, "mode": None}
     path = key[len(prefix) :].lstrip("/")
     parts = path.split("/")
 

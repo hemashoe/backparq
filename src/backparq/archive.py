@@ -10,7 +10,7 @@ import sys
 import threading
 import time
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 from backparq.config import BackparqConfig
 from backparq.db import (
@@ -52,7 +52,9 @@ from backparq.utils.logging import log_with_data
 logger = logging.getLogger(__name__)
 
 
-def _update_result(chunks=0, rows=0, bytes_up=0, error=None):
+def _update_result(
+    chunks: int = 0, rows: int = 0, bytes_up: int = 0, error: Optional[str] = None
+) -> None:
     with _result_lock:
         _current_result.chunks_archived += chunks
         _current_result.rows_archived += rows
@@ -112,7 +114,7 @@ def s3_key_for_chunk(
     return f"{base_prefix}/archive/{safe_table}/year={year:04d}/month={month:02d}/{name}"
 
 
-def _s3_extra_args(config) -> dict:
+def _s3_extra_args(config: Any) -> dict[str, Any]:
     """Build S3 upload arguments."""
     args = {}
     if config.sse:
@@ -125,14 +127,14 @@ def _s3_extra_args(config) -> dict:
 def _process_chunk(
     chunk: ChunkSpec,
     config: BackparqConfig,
-    pool,
-    s3,
+    pool: Any,
+    s3: Any,
     do_upload: bool,
-    extra_args: dict,
-    encryption_properties,
+    extra_args: dict[str, Any],
+    encryption_properties: Any,
     run_id: Optional[str] = None,
     shutdown_event: Optional[threading.Event] = None,
-) -> dict:
+) -> dict[str, int]:
     """Process a single chunk. Returns stats dict."""
     if shutdown_event and shutdown_event.is_set():
         return {"rows": 0, "bytes": 0}
@@ -146,13 +148,13 @@ def _process_chunk(
 def _process_chunk_impl(
     chunk: ChunkSpec,
     config: BackparqConfig,
-    conn,
-    s3,
+    conn: Any,
+    s3: Any,
     do_upload: bool,
-    extra_args: dict,
-    encryption_properties,
+    extra_args: dict[str, Any],
+    encryption_properties: Any,
     run_id: Optional[str] = None,
-) -> dict:
+) -> dict[str, int]:
     """Core chunk processing logic."""
     stats = {"rows": 0, "bytes": 0}
 
@@ -247,6 +249,7 @@ def _process_chunk_impl(
         stats["rows"] = row_count
         stats["bytes"] = final_parquet.stat().st_size
     else:
+        assert existing is not None
         sha = existing.get("sha256", compute_sha256(final_parquet))
         stats["bytes"] = final_parquet.stat().st_size if final_parquet.exists() else 0
 
@@ -278,11 +281,11 @@ def _process_chunk_impl(
             uploaded = True
 
     # Write manifest
-    manifest = {
+    manifest: dict[str, Any] = {
         "table": chunk.table,
         "start": chunk.start.isoformat(),
         "end": chunk.end.isoformat(),
-        "exported_rows": stats["rows"] or existing.get("exported_rows"),
+        "exported_rows": stats["rows"] or (existing.get("exported_rows") if existing else 0),
         "sha256": sha,
         "s3_key": s3_key if do_upload else None,
         "s3_verified": uploaded,
@@ -312,16 +315,16 @@ def _process_chunk_impl(
 def _process_table(
     table: str,
     config: BackparqConfig,
-    pool,
-    s3,
-    extra_args: dict,
+    pool: Any,
+    s3: Any,
+    extra_args: dict[str, Any],
     run_id: Optional[str],
-    progress,
-    task_id,
+    progress: Any,
+    task_id: Any,
     shutdown_event: threading.Event,
-) -> dict:
+) -> dict[str, int]:
     """Process all chunks for a table."""
-    table_stats = {"chunks": 0, "rows": 0, "bytes": 0}
+    table_stats: dict[str, int] = {"chunks": 0, "rows": 0, "bytes": 0}
 
     if shutdown_event.is_set():
         return table_stats
@@ -418,7 +421,7 @@ def _process_table(
     return table_stats
 
 
-def _write_progress(path: Path, run_progress: RunProgress):
+def _write_progress(path: Path, run_progress: RunProgress) -> None:
     """Write progress file."""
     with open(path, "w") as f:
         json.dump(run_progress.to_dict(), f, indent=2)

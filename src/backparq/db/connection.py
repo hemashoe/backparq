@@ -1,11 +1,10 @@
-"""Database connection and pooling."""
-
 from __future__ import annotations
 
 import logging
 import threading
+from collections.abc import Iterator
 from contextlib import contextmanager
-from typing import Optional
+from typing import Any, Optional
 
 import psycopg2
 from psycopg2 import pool
@@ -17,7 +16,7 @@ logger = logging.getLogger(__name__)
 
 
 @retry(stop=stop_after_attempt(5), wait=wait_exponential(multiplier=1, min=2, max=30))
-def connect(config: DatabaseConfig):
+def connect(config: DatabaseConfig) -> psycopg2.extensions.connection:
     """Create a PostgreSQL connection with retry logic."""
     logger.debug(f"Connecting to {config.host}:{config.port}/{config.name}")
     conn = psycopg2.connect(config.dsn())
@@ -65,7 +64,7 @@ class ConnectionPool:
         return self._pool
 
     @contextmanager
-    def connection(self):
+    def connection(self) -> Iterator[psycopg2.extensions.connection]:
         p = self._ensure_pool()
         conn = p.getconn()
         try:
@@ -78,7 +77,7 @@ class ConnectionPool:
             p.putconn(conn)
 
     @contextmanager
-    def autocommit_connection(self):
+    def autocommit_connection(self) -> Iterator[psycopg2.extensions.connection]:
         """Connection with autocommit for DDL operations like VACUUM."""
         p = self._ensure_pool()
         conn = p.getconn()
@@ -96,8 +95,8 @@ class ConnectionPool:
             self._pool = None
             logger.info("Pool closed")
 
-    def __enter__(self):
+    def __enter__(self) -> ConnectionPool:
         return self
 
-    def __exit__(self, *args):
+    def __exit__(self, *args: Any) -> None:
         self.close()

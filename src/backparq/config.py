@@ -132,7 +132,7 @@ class ArchiveConfig:
     vacuum: bool = False
     retention: RetentionConfig = field(default_factory=RetentionConfig)
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         if self.mode not in ("backup", "offload"):
             raise ConfigError(f"Invalid mode '{self.mode}'. Must be 'backup' or 'offload'.")
         if self.mode == "backup" and self.perform_delete:
@@ -236,9 +236,9 @@ def parse_cutoff(value: str) -> dt.datetime:
 def _require_section(data: dict[str, Any], key: str) -> dict[str, Any]:
     """Require a config section to exist and be a dict."""
     value = data.get(key)
-    if value is None or not isinstance(value, dict):
-        raise ConfigError(f"Missing or invalid '{key}' section in config.")
-    return value
+    if isinstance(value, dict):
+        return value
+    raise ConfigError(f"Missing or invalid '{key}' section in config.")
 
 
 def _require_str(data: dict[str, Any], key: str) -> str:

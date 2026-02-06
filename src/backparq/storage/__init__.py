@@ -41,4 +41,3 @@ __all__ = [
     "write_parquet",
     "build_encryption",
 ]
-

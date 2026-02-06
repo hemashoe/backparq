@@ -1,9 +1,3 @@
-"""File-based lock to prevent concurrent runs.
-
-Uses atomic file creation (O_CREAT|O_EXCL) to prevent race conditions
-where two processes could acquire the lock simultaneously.
-"""
-
 from __future__ import annotations
 
 import json
@@ -11,10 +5,11 @@ import logging
 import os
 import socket
 import time
+from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -38,7 +33,10 @@ class Lock:
             return None
         try:
             with open(self.lock_path) as f:
-                return json.load(f)
+                data = json.load(f)
+                if isinstance(data, dict):
+                    return data
+                return None
         except (json.JSONDecodeError, OSError):
             return None
 
@@ -160,16 +158,16 @@ class Lock:
             logger.info("Lock released")
 
     @contextmanager
-    def hold(self, timeout: int = 0):
+    def hold(self, timeout: int = 0) -> Iterator[None]:
         self.acquire(timeout=timeout)
         try:
             yield
         finally:
             self.release()
 
-    def __enter__(self):
+    def __enter__(self) -> Lock:
         self.acquire()
         return self
 
-    def __exit__(self, *args):
+    def __exit__(self, *args: Any) -> None:
         self.release()

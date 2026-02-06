@@ -5,9 +5,11 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+from collections.abc import Iterator
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
+import pyarrow as pa
 import pyarrow.parquet as pq
 
 from backparq.config import ParquetConfig
@@ -41,14 +43,17 @@ def load_manifest(path: Path) -> Optional[dict]:
     if not path.exists():
         return None
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(data, dict):
+            return data
+        return None
     except json.JSONDecodeError:
         return None
 
 
 def get_row_count(path: Path) -> int:
     """Read row count from Parquet footer."""
-    return pq.ParquetFile(str(path)).metadata.num_rows
+    return int(pq.ParquetFile(str(path)).metadata.num_rows)
 
 
 def validate_file(path: Path, expected_rows: int) -> int:
@@ -61,12 +66,14 @@ def validate_file(path: Path, expected_rows: int) -> int:
     return rows
 
 
-def read_parquet(path: Path, decryption_props=None):
+def read_parquet(path: Path, decryption_props: Any = None) -> pa.Table:
     """Read Parquet file to Arrow table (loads entire file into memory)."""
     return pq.read_table(str(path), decryption_properties=decryption_props)
 
 
-def read_parquet_batches(path: Path, batch_size: int = 10_000, decryption_props=None):
+def read_parquet_batches(
+    path: Path, batch_size: int = 10_000, decryption_props: Any = None
+) -> Iterator[pa.RecordBatch]:
     """
     Stream Parquet file as batches to handle large files without memory issues.
 
@@ -85,20 +92,22 @@ def read_parquet_batches(path: Path, batch_size: int = 10_000, decryption_props=
     yield from parquet_file.iter_batches(batch_size=batch_size)
 
 
-def get_parquet_schema(path: Path, decryption_props=None):
+def get_parquet_schema(path: Path, decryption_props: Any = None) -> pa.Schema:
     """Get schema from Parquet file without reading all data."""
     parquet_file = pq.ParquetFile(str(path), decryption_properties=decryption_props)
     return parquet_file.schema_arrow
 
 
-def write_parquet(table, path: Path, compression: str = "snappy", encryption_props=None) -> None:
+def write_parquet(
+    table: pa.Table, path: Path, compression: str = "snappy", encryption_props: Any = None
+) -> None:
     """Write Arrow table to Parquet."""
     pq.write_table(
         table, str(path), compression=compression, encryption_properties=encryption_props
     )
 
 
-def build_encryption(config: ParquetConfig):
+def build_encryption(config: ParquetConfig) -> Any:
     """Build encryption properties. Returns None if disabled."""
     if not config.encryption.enabled:
         return None

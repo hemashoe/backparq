@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import datetime as dt
 import logging
+from typing import TypedDict
 
 from rich.table import Table
 
@@ -19,8 +20,18 @@ from backparq.utils.console import (
 logger = logging.getLogger(__name__)
 
 
-def prune_backups(config: BackparqConfig, dry_run: bool = False) -> dict:
-    result = {"deleted": [], "summary": {"files_deleted": 0, "bytes_freed": 0}}
+class PruneSummary(TypedDict):
+    files_deleted: int
+    bytes_freed: int
+
+
+class PruneResult(TypedDict):
+    deleted: list[str]
+    summary: PruneSummary
+
+
+def prune_backups(config: BackparqConfig, dry_run: bool = False) -> PruneResult:
+    result: PruneResult = {"deleted": [], "summary": {"files_deleted": 0, "bytes_freed": 0}}
 
     if not config.archive.retention.enabled:
         print_warning("Retention disabled")

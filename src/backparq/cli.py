@@ -1,5 +1,3 @@
-"""CLI for backparq."""
-
 from __future__ import annotations
 
 import argparse
@@ -7,6 +5,7 @@ import json
 import logging
 import sys
 from pathlib import Path
+from typing import Any
 
 from backparq.archive import archive_tables
 from backparq.check import check_backups
@@ -49,7 +48,7 @@ def run_tests(config: BackparqConfig) -> None:
         verify_s3_connection(config.s3)
 
 
-def handle_test(args):
+def handle_test(args: argparse.Namespace) -> None:
     config = _load_config(args.config)
     run_tests(config)
     print_success("All connections validated")
@@ -59,13 +58,13 @@ import signal
 import threading
 
 
-def handle_archive(args):
+def handle_archive(args: argparse.Namespace) -> None:
     config = _load_config(args.config)
     run_tests(config)
 
     shutdown_event = threading.Event()
 
-    def signal_handler(sig, frame):
+    def signal_handler(sig: int, frame: Any) -> None:
         logger.warning(f"Received signal {sig}, initiating graceful shutdown...")
         shutdown_event.set()
 
@@ -88,14 +87,14 @@ def handle_archive(args):
         signal.signal(signal.SIGTERM, original_sigterm)
 
 
-def handle_apply(args):
+def handle_apply(args: argparse.Namespace) -> None:
     """Legacy command - just runs archive."""
     config = _load_config(args.config)
     run_tests(config)
     archive_tables(config)
 
 
-def handle_restore(args):
+def handle_restore(args: argparse.Namespace) -> None:
     config = _load_config(args.config)
     try:
         start, end = parse_utc_datetime(args.start), parse_utc_datetime(args.end)
@@ -105,26 +104,26 @@ def handle_restore(args):
     restore_tables(config, start, end, args.dry_run, args.conflict_mode, args.backup_id)
 
 
-def handle_check(args):
+def handle_check(args: argparse.Namespace) -> None:
     check_backups(_load_config(args.config))
 
 
-def handle_prune(args):
+def handle_prune(args: argparse.Namespace) -> None:
     prune_backups(_load_config(args.config), dry_run=args.dry_run)
 
 
-def handle_plan(args):
+def handle_plan(args: argparse.Namespace) -> None:
     plan = plan_archive(_load_config(args.config))
     print(json.dumps(plan, indent=2, default=str))
 
 
-def handle_status(args):
+def handle_status(args: argparse.Namespace) -> None:
     show_status(
         _load_config(args.config), table_filter=args.table, output_json=args.output == "json"
     )
 
 
-def handle_verify(args):
+def handle_verify(args: argparse.Namespace) -> None:
     result = verify_archives(_load_config(args.config), repair=args.repair, table_filter=args.table)
     if args.output == "json":
         print(json.dumps(result.to_dict(), indent=2))
@@ -132,7 +131,7 @@ def handle_verify(args):
         sys.exit(EXIT_RUNTIME_ERROR)
 
 
-def handle_validate(args):
+def handle_validate(args: argparse.Namespace) -> None:
     """Validate configuration and connections."""
     console.print("[bold]Validating configuration...[/bold]")
     try:
@@ -168,7 +167,7 @@ def handle_validate(args):
 from backparq.query import run_query
 
 
-def handle_query(args):
+def handle_query(args: argparse.Namespace) -> None:
     """Run SQL query against archives."""
     config = _load_config(args.config)
     # Basic validation but no full test_pg_connection needed for S3 query
@@ -179,7 +178,7 @@ def handle_query(args):
     run_query(config, args.sql)
 
 
-def handle_init(args):
+def handle_init(args: argparse.Namespace) -> None:
     from rich.prompt import Prompt
 
     from backparq.utils.console import console
@@ -187,7 +186,7 @@ def handle_init(args):
     console.print("[bold]Backparq Configuration Generator[/bold]")
     console.print()
 
-    config = {
+    config: dict[str, Any] = {
         "database": {
             "host": Prompt.ask("Database host", default="localhost"),
             "port": int(Prompt.ask("Database port", default="5432")),
@@ -241,15 +240,11 @@ Examples:
   backparq restore --config config.yaml --start 2024-01-01 --end 2024-04-01
 """,
     )
-    parser.add_argument(
-        "-V", "--version", action="version", version=f"%(prog)s {__version__}"
-    )
+    parser.add_argument("-V", "--version", action="version", version=f"%(prog)s {__version__}")
     parser.add_argument(
         "-v", "--verbose", action="count", default=0, help="Verbosity (-v INFO, -vv DEBUG)"
     )
-    parser.add_argument(
-        "-q", "--quiet", action="store_true", help="Suppress progress output"
-    )
+    parser.add_argument("-q", "--quiet", action="store_true", help="Suppress progress output")
     parser.add_argument(
         "--log-format",
         choices=["text", "json"],

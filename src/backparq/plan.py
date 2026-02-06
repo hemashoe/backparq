@@ -19,7 +19,7 @@ def plan_archive(config: BackparqConfig) -> dict[str, Any]:
 
     Returns a dict structure suitable for JSON output.
     """
-    plan = {
+    plan: dict[str, Any] = {
         "tables": [],
         "summary": {
             "total_chunks_to_archive": 0,
@@ -42,7 +42,11 @@ def plan_archive(config: BackparqConfig) -> dict[str, Any]:
         table_names = config.archive.table_names
 
         for table in table_names:
-            table_plan = {"name": table, "chunks": [], "stats": {"to_archive": 0, "existing": 0}}
+            table_plan: dict[str, Any] = {
+                "name": table,
+                "chunks": [],
+                "stats": {"to_archive": 0, "existing": 0},
+            }
 
             cutoff = config.archive.cutoff_exclusive
             if config.archive.mode == "backup" or cutoff is None:
@@ -51,7 +55,7 @@ def plan_archive(config: BackparqConfig) -> dict[str, Any]:
             chunks = list_chunks(conn, table, cutoff, config.archive.order_by)
 
             for chunk in chunks:
-                chunk_info = {
+                chunk_info: dict[str, Any] = {
                     "start": chunk.start.isoformat(),
                     "end": chunk.end.isoformat(),
                     "rows_in_db": 0,

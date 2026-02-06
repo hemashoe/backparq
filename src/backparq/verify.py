@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 from backparq.config import BackparqConfig
 from backparq.models import VerifyResult
@@ -115,7 +115,7 @@ def verify_archives(
     return result
 
 
-def _repair_from_s3(s3, config: BackparqConfig, local_path: Path, manifest: dict) -> bool:
+def _repair_from_s3(s3: Any, config: BackparqConfig, local_path: Path, manifest: dict) -> bool:
     s3_key = manifest.get("s3_key", "")
     if not s3_key:
         return False
@@ -128,7 +128,7 @@ def _repair_from_s3(s3, config: BackparqConfig, local_path: Path, manifest: dict
 
 
 def _repair_to_s3(
-    s3, config: BackparqConfig, local_path: Path, s3_key: str, expected_sha: str
+    s3: Any, config: BackparqConfig, local_path: Path, s3_key: str, expected_sha: str
 ) -> bool:
     try:
         s3.upload_file(

@@ -1,5 +1,3 @@
-"""Console output utilities."""
-
 from __future__ import annotations
 
 from rich.console import Console
@@ -74,11 +72,12 @@ def print_stats(stats: dict) -> None:
 
 
 def format_size(size_bytes: int) -> str:
+    size: float = float(size_bytes)
     for unit in ["B", "KB", "MB", "GB", "TB"]:
-        if size_bytes < 1024:
-            return f"{size_bytes:.1f} {unit}"
-        size_bytes /= 1024
-    return f"{size_bytes:.1f} PB"
+        if size < 1024:
+            return f"{size:.1f} {unit}"
+        size /= 1024
+    return f"{size:.1f} PB"
 
 
 def format_count(count: int) -> str:
