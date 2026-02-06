@@ -1,0 +1,236 @@
+# =============================================================================
+# BACKPARQ - OFFLOAD MODE CONFIGURATION
+# =============================================================================
+#
+# PURPOSE:
+#   Archive "cold" data (older than X days/months) from PostgreSQL to S3
+#   as Parquet files, and optionally DELETE the archived data from the
+#   source database to reclaim space.
+#
+# USE CASE:
+#   - Free up PostgreSQL disk space by moving old data to cheap S3 storage
+#   - Keep data queryable via DuckDB, Athena, or Spark
+#   - Comply with data retention policies while maintaining audit trails
+#
+# HOW TO USE:
+#   1. Copy this file and adjust values for your environment
+#   2. Set environment variables: PG_PASSWORD, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY
+#   3. Test: backparq test --config offload.yaml
+#   4. Dry run: backparq archive --config offload.yaml --dry-run
+#   5. Execute: backparq archive --config offload.yaml --stats
+#
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# DATABASE CONNECTION
+# -----------------------------------------------------------------------------
+# PostgreSQL connection settings. Use environment variables for secrets.
+database:
+  # REQUIRED: PostgreSQL host (IP or hostname)
+  host: "${PG_HOST:-localhost}"
+
+  # PostgreSQL port (default: 5432)
+  port: 5432
+
+  # REQUIRED: Database name to connect to
+  name: "${PG_DATABASE}"
+
+  # REQUIRED: PostgreSQL username
+  user: "${PG_USER:-postgres}"
+
+  # REQUIRED: PostgreSQL password (use env var for security)
+  password: "${PG_PASSWORD}"
+
+  # SSL mode for connection security
+  # Options: disable, allow, prefer, require, verify-ca, verify-full
+  sslmode: "prefer"
+
+  # Connection timeout in seconds
+  connect_timeout: 10
+
+# -----------------------------------------------------------------------------
+# S3 STORAGE
+# -----------------------------------------------------------------------------
+# Where to store the archived Parquet files.
+s3:
+  # REQUIRED: S3 bucket name
+  bucket: "${S3_BUCKET}"
+
+  # Prefix (folder) within the bucket for archives
+  # Default: "db-archive"
+  prefix: "archive"
+
+  # AWS region for the bucket
+  region: "${AWS_REGION:-us-east-1}"
+
+  # AWS credentials (optional if using IAM roles, EC2 instance profiles,
+  # or ~/.aws/credentials file)
+  access_key_id: "${AWS_ACCESS_KEY_ID}"
+  secret_access_key: "${AWS_SECRET_ACCESS_KEY}"
+
+  # For temporary credentials (STS assume role)
+  # session_token: "${AWS_SESSION_TOKEN}"
+
+  # Server-Side Encryption (recommended for security)
+  # Options: "AES256" (SSE-S3) or "aws:kms" (SSE-KMS)
+  sse: "AES256"
+
+  # KMS key ID/alias (required if sse is "aws:kms")
+  # kms_key_id: "alias/my-backup-key"
+
+  # For S3-compatible storage (MinIO, Cloudflare R2, DigitalOcean Spaces, etc.)
+  # endpoint_url: "https://s3.example.com"
+  # use_ssl: true
+  # verify_ssl: true
+  # addressing_style: "path"  # Options: path, virtual, auto
+
+# -----------------------------------------------------------------------------
+# PARQUET FORMAT
+# -----------------------------------------------------------------------------
+# Settings for the output Parquet files.
+parquet:
+  # Compression algorithm for Parquet files
+  # Options: zstd (best ratio), snappy (fast), gzip, brotli, lz4, none
+  # Recommendation: "zstd" for production, "snappy" for speed
+  compression: "zstd"
+
+  # Number of rows per row group (affects query performance)
+  # Higher = better compression, Lower = faster random access
+  # Typical range: 50,000 - 1,000,000
+  row_group_size: 100000
+
+  # Client-Side Encryption (optional - for highly sensitive data)
+  # Parquet files will be encrypted before upload to S3
+  encryption:
+    enabled: false
+    # footer_key: "${PARQUET_FOOTER_KEY}"  # Base64-encoded 32-byte key
+    # key_map:
+    #   "k1": "${PARQUET_KEY_1}"           # Key ID to key material
+    # column_keys:
+    #   "public.users.ssn": "k1"           # Column-level encryption
+
+# -----------------------------------------------------------------------------
+# ARCHIVE SETTINGS
+# -----------------------------------------------------------------------------
+# Core archiving behavior and table configuration.
+archive:
+  # REQUIRED: Operation mode
+  # - "offload": Archive old data and optionally DELETE from database
+  # - "backup": Full snapshots for disaster recovery (no deletion)
+  mode: "offload"
+
+  # Local directory for temporary Parquet files before S3 upload
+  # These are kept for verification and can be used for local restore
+  base_dir: "./backparq-data"
+
+  # ---------------------------------------------------------------------
+  # CUTOFF DATE (Offload mode only)
+  # ---------------------------------------------------------------------
+  # Only data OLDER than this date will be archived.
+  # Supports relative and absolute formats:
+  #
+  # RELATIVE (recommended):
+  #   cutoff: "-30d"   # 30 days ago
+  #   cutoff: "-90d"   # 90 days ago
+  #   cutoff: "-6m"    # 6 months ago (180 days)
+  #   cutoff: "-1y"    # 1 year ago (365 days)
+  #
+  # ABSOLUTE (ISO8601):
+  #   cutoff: "2024-01-01"
+  #   cutoff: "2024-06-15T00:00:00Z"
+  cutoff: "-90d"
+
+  # Alternative key name (both work the same)
+  # cutoff_exclusive: "-90d"
+
+  # Column used to determine data age (timestamp/date column)
+  # This column is used to filter rows and partition data by month
+  order_by: "created_at"
+
+  # ---------------------------------------------------------------------
+  # DELETION SETTINGS (⚠️ DANGER ZONE)
+  # ---------------------------------------------------------------------
+  # If true, rows are PERMANENTLY DELETED from PostgreSQL after:
+  #   1. Successful Parquet file creation
+  #   2. SHA256 checksum computation
+  #   3. Successful S3 upload
+  #   4. S3 checksum verification
+  #
+  # Data is NEVER deleted if any step fails.
+  # Start with false, test thoroughly, then enable.
+  perform_delete: false
+
+  # Number of rows to delete per transaction (reduces lock contention)
+  delete_batch_size: 10000
+
+  # Run VACUUM after deletion (can be resource intensive on large tables)
+  vacuum: false
+
+  # ---------------------------------------------------------------------
+  # PERFORMANCE TUNING
+  # ---------------------------------------------------------------------
+  # Number of tables to process in parallel
+  concurrency: 2
+
+  # Number of monthly chunks to process in parallel per table
+  chunk_concurrency: 4
+
+  # Rows to fetch per database cursor batch (memory vs speed tradeoff)
+  fetch_size: 50000
+
+  # ---------------------------------------------------------------------
+  # SAFETY FLAGS
+  # ---------------------------------------------------------------------
+  # Simulate operations without writing files or deleting data
+  dry_run: false
+
+  # Re-archive chunks that already exist (overwrites existing files)
+  overwrite: false
+
+  # ---------------------------------------------------------------------
+  # TABLES TO ARCHIVE
+  # ---------------------------------------------------------------------
+  # List of tables to archive. Supports two formats:
+  #
+  # SIMPLE FORMAT (uses default primary_key "id"):
+  #   - public.events
+  #   - public.logs
+  #
+  # ADVANCED FORMAT (custom settings per table):
+  #   - table: public.orders
+  #     primary_key: order_id
+  #     order_by: created_at
+  #     masking:
+  #       email: hash      # SHA256 hash
+  #       phone: redact    # Replace with "REDACTED"
+  #       ssn: "null"      # Set to NULL
+  tables:
+    # Simple table (uses defaults)
+    - public.events
+
+    # Table with custom primary key
+    - table: public.audit_logs
+      primary_key: log_id
+      order_by: timestamp
+
+    # Table with data masking (for privacy compliance)
+    - table: public.user_activity
+      primary_key: id
+      masking:
+        email: hash # SHA256 hash for pseudonymization
+        ip_address: redact # Replace with "REDACTED"
+
+  # ---------------------------------------------------------------------
+  # RETENTION POLICY
+  # ---------------------------------------------------------------------
+  # Configure automatic pruning of old archives.
+  # Run: backparq prune --config offload.yaml
+  retention:
+    # Enable retention-based pruning
+    enabled: true
+
+    # Keep archives for this many days
+    days: 365
+
+    # OR keep for this many months (both can be combined)
+    # months: 12

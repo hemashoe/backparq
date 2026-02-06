@@ -6,9 +6,11 @@ import tempfile
 from pathlib import Path
 
 from backparq.storage.parquet import (
+    compute_sha256 as sha256_file,
+)
+from backparq.storage.parquet import (
     load_manifest,
     safe_mkdir,
-    compute_sha256 as sha256_file,
     write_manifest,
 )
 

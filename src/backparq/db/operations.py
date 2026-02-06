@@ -233,10 +233,10 @@ def export_chunk_to_parquet_streaming(
                 rows = cur.fetchmany(fetch_size)
                 if not rows:
                     break
-                
+
                 # Apply masking if configured
                 if masking:
-                     _apply_masking(rows, masking)
+                    _apply_masking(rows, masking)
 
                 if schema is None:
                     import pyarrow as pa
@@ -256,7 +256,9 @@ def export_chunk_to_parquet_streaming(
                     logger.debug(f"Initialized Parquet writer with {len(schema)} columns")
 
                 assert schema is not None and writer is not None
-                rb = pa.Table.from_pylist(rows, schema=schema).to_batches(max_chunksize=len(rows))[0]
+                rb = pa.Table.from_pylist(rows, schema=schema).to_batches(max_chunksize=len(rows))[
+                    0
+                ]
                 writer.write_batch(rb)
                 exported += len(rows)
                 batch_count += 1
@@ -345,24 +347,24 @@ def delete_chunk_with_verification(
 ) -> bool:
     """Delete chunk after verifying S3 backup exists and matches checksum."""
     from backparq.s3 import s3_verify_object_sha256
-    
+
     logger.info(f"Pre-delete verification for {table} [{start.strftime('%Y-%m')}]")
-    
+
     if not s3_verify_object_sha256(s3_client, s3_bucket, s3_key, expected_sha256):
         logger.error(f"S3 verification failed for {s3_key}. Data NOT deleted.")
         return False
-    
+
     db_row_count = pg_count_rows(conn, table, start, end, order_by)
     if db_row_count == 0:
         logger.info("No rows to delete")
         return True
-    
-    batch_size = getattr(config.archive, 'delete_batch_size', 10000)
+
+    batch_size = getattr(config.archive, "delete_batch_size", 10000)
     deleted = delete_chunk_safely(conn, table, start, end, batch_size, order_by)
-    
+
     if deleted != db_row_count:
         logger.warning(f"Deleted {deleted} rows but expected {db_row_count}")
-    
+
     return True
 
 
@@ -414,15 +416,16 @@ def insert_arrow_table_to_pg(
         return 0
 
     logger.info(f"Inserting {arrow_table.num_rows} rows into {table} (mode: {conflict_mode})")
-    
+
     # Check for complex types that pyarrow.csv might not handle compatibly with Postgres
     import pyarrow as pa
+
     has_complex_types = False
     for field in arrow_table.schema:
         if pa.types.is_nested(field.type) or pa.types.is_dictionary(field.type):
             has_complex_types = True
             break
-            
+
     if has_complex_types:
         logger.debug("Schema contains complex types; using slow serialization path")
     else:
@@ -435,14 +438,14 @@ def insert_arrow_table_to_pg(
 
     for batch in arrow_table.to_batches(max_chunksize=batch_size):
         if batch.num_rows == 0:
-             continue
+            continue
 
         buf = io.BytesIO()
-        
+
         if not has_complex_types:
             # FAST PATH: Use pyarrow.csv
             import pyarrow.csv as pacsv
-            
+
             # Configure pyarrow to write CSV compatible with Postgres COPY (FORMAT CSV)
             # - No header
             # - Tab delimiter (to match our COPY command)
@@ -450,29 +453,27 @@ def insert_arrow_table_to_pg(
             # - Escape '"' (default)
             # - Nulls as empty string (default)
             write_options = pacsv.WriteOptions(
-                include_header=False,
-                delimiter="\t",
-                quoting_style="needed"
+                include_header=False, delimiter="\t", quoting_style="needed"
             )
             pacsv.write_csv(batch, buf, write_options=write_options)
-            
+
             # pyarrow writes binary utf-8, perfect for BytesIO
-            
+
         else:
             # SLOW PATH: Manual serialization
             # We must use StringIO for csv module
             text_buf = io.StringIO()
             writer = csv.writer(text_buf, delimiter="\t", quoting=csv.QUOTE_MINIMAL, quotechar='"')
-            
+
             rows = batch.to_pylist()
             for row in rows:
                 csv_row = [_serialize_for_postgres(row[c]) for c in columns]
                 writer.writerow(csv_row)
-            
+
             # Encode to bytes for copy_expert
             text_buf.seek(0)
             buf.write(text_buf.getvalue().encode("utf-8"))
-            
+
         buf.seek(0)
 
         stage_table = f"stage_{int(time.time() * 1000000)}"
@@ -490,7 +491,7 @@ def insert_arrow_table_to_pg(
             copy_sql = sql.SQL(
                 "COPY {stage} ({cols}) FROM STDIN WITH (FORMAT CSV, DELIMITER E'\\t', QUOTE '\"', NULL '')"
             ).format(stage=stage_ident, cols=cols_str)
-            
+
             cur.copy_expert(copy_sql.as_string(conn), buf)
 
             # Build INSERT/UPSERT query
@@ -528,6 +529,7 @@ def insert_arrow_table_to_pg(
     logger.info(f"Insert complete: {total_inserted} rows affected")
     return total_inserted
 
+
 def vacuum_table(config: DatabaseConfig, table: str) -> None:
     """
     Run VACUUM ANALYZE on a table to reclaim storage.
@@ -535,7 +537,7 @@ def vacuum_table(config: DatabaseConfig, table: str) -> None:
     Must run outside of a transaction block (autocommit=True).
     """
     logger.info(f"Vacuuming table {table}...")
-    
+
     # Create a fresh connection specifically for VACUUM
     # We don't reuse the existing connection because we need autocommit=True
     # and we don't want to mess with the main connection's state.
@@ -552,17 +554,18 @@ def vacuum_table(config: DatabaseConfig, table: str) -> None:
     finally:
         conn.close()
 
+
 def _apply_masking(rows: list[dict], masking: dict[str, str]) -> None:
     """Apply masking rules to a batch of rows in-place."""
     import hashlib
-    
+
     for row in rows:
         for col, rule in masking.items():
             if col not in row or row[col] is None:
                 continue
-                
+
             val = str(row[col])
-            
+
             if rule == "hash":
                 # SHA256 hash
                 row[col] = hashlib.sha256(val.encode("utf-8")).hexdigest()

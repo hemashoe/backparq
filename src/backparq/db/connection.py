@@ -39,7 +39,7 @@ def test_connection(config: DatabaseConfig) -> None:
 
 class ConnectionPool:
     """Thread-safe connection pool."""
-    
+
     def __init__(self, config: DatabaseConfig, minconn: int = 2, maxconn: int = 10):
         self.config = config
         self.minconn = minconn

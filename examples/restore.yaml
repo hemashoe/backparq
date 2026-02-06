@@ -1,0 +1,164 @@
+# =============================================================================
+# BACKPARQ - RESTORE CONFIGURATION
+# =============================================================================
+#
+# PURPOSE:
+#   Restore archived data from S3 Parquet files back to PostgreSQL.
+#   Works with both offload archives and backup snapshots.
+#
+# USE CASES:
+#   - Disaster recovery (restore from backup after data loss)
+#   - Data recovery (restore accidentally deleted data from offload archive)
+#   - Data migration (move archived data to a new database)
+#   - Testing (restore production data to staging/dev environment)
+#
+# IMPORTANT NOTES:
+#   - Restore DOWNLOADS files from S3 before inserting into PostgreSQL
+#   - Schema must match: tables and columns must exist in the target database
+#   - Schema evolution: archived columns not in current schema are skipped
+#   - Conflict handling: choose how to handle existing rows
+#
+# =============================================================================
+# RESTORE COMMAND EXAMPLES
+# =============================================================================
+#
+# 1. RESTORE FROM OFFLOAD ARCHIVE (date range):
+#    Restore data archived during the date range.
+#
+#    backparq restore --config restore.yaml \
+#      --start 2024-01-01 --end 2024-03-01
+#
+# 2. RESTORE FROM BACKUP SNAPSHOT (specific backup):
+#    Restore from a specific backup run using its Run ID.
+#
+#    backparq restore --config restore.yaml \
+#      --backup-id 2024-01-15_120000 \
+#      --start 2024-01-01 --end 2024-01-31
+#
+# 3. CONFLICT RESOLUTION OPTIONS:
+#    Handle rows that already exist in the database.
+#
+#    # Skip existing rows (default - faster, preserves current data)
+#    backparq restore --config restore.yaml \
+#      --start 2024-01-01 --end 2024-02-01 \
+#      --conflict-mode do_nothing
+#
+#    # Update existing rows with archived data (slower, overwrites current)
+#    backparq restore --config restore.yaml \
+#      --start 2024-01-01 --end 2024-02-01 \
+#      --conflict-mode upsert
+#
+# 4. DRY RUN (preview without changes):
+#    backparq restore --config restore.yaml \
+#      --start 2024-01-01 --end 2024-02-01 \
+#      --dry-run
+#
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# DATABASE CONNECTION
+# -----------------------------------------------------------------------------
+# Target PostgreSQL database where data will be restored.
+database:
+  # REQUIRED: Target database host
+  host: "${PG_HOST:-localhost}"
+
+  # PostgreSQL port
+  port: 5432
+
+  # REQUIRED: Target database name
+  name: "${PG_DATABASE}"
+
+  # REQUIRED: Username with INSERT permissions
+  user: "${PG_USER:-postgres}"
+
+  # REQUIRED: Password
+  password: "${PG_PASSWORD}"
+
+  # SSL mode
+  sslmode: "prefer"
+
+  # Connection timeout
+  connect_timeout: 10
+
+# -----------------------------------------------------------------------------
+# S3 STORAGE
+# -----------------------------------------------------------------------------
+# S3 location of the archived Parquet files.
+s3:
+  # REQUIRED: S3 bucket containing archives
+  bucket: "${S3_BUCKET}"
+
+  # Prefix path where archives are stored
+  # Use "archive" for offload mode archives
+  # Use "backups" for backup mode snapshots
+  prefix: "archive"
+
+  # AWS region
+  region: "${AWS_REGION:-us-east-1}"
+
+  # AWS credentials
+  access_key_id: "${AWS_ACCESS_KEY_ID}"
+  secret_access_key: "${AWS_SECRET_ACCESS_KEY}"
+
+  # For S3-compatible storage
+  # endpoint_url: "https://s3.example.com"
+  # use_ssl: true
+  # verify_ssl: true
+  # addressing_style: "path"
+
+# -----------------------------------------------------------------------------
+# ARCHIVE SETTINGS
+# -----------------------------------------------------------------------------
+archive:
+  # Local directory for downloaded Parquet files
+  base_dir: "./backparq-data"
+
+  # ---------------------------------------------------------------------
+  # TABLES TO RESTORE
+  # ---------------------------------------------------------------------
+  # Specify which tables to restore and their primary keys.
+  # The primary_key is REQUIRED for upsert conflict resolution.
+  #
+  # Tables must:
+  #   1. Exist in the target database
+  #   2. Have matching column names (extra archived columns are skipped)
+  #   3. Have the same primary key structure
+  tables:
+    - table: public.events
+      primary_key: id
+
+    - table: public.audit_logs
+      primary_key: log_id
+
+    - table: public.user_activity
+      primary_key: id
+
+# =============================================================================
+# CONFLICT MODE EXPLAINED
+# =============================================================================
+#
+# When restoring data, rows might already exist in the target table.
+# Use --conflict-mode to control behavior:
+#
+# --conflict-mode do_nothing (DEFAULT):
+#   - Skip rows that already exist (based on primary key)
+#   - Faster - uses INSERT ... ON CONFLICT DO NOTHING
+#   - Safe - preserves your current data
+#   - Use when: restoring missing rows without overwriting recent changes
+#
+# --conflict-mode upsert:
+#   - Update existing rows with archived data
+#   - Uses INSERT ... ON CONFLICT DO UPDATE
+#   - Overwrites current data with archived version
+#   - Use when: reverting to archived state, disaster recovery
+#
+# EXAMPLES:
+#
+# Scenario 1: Restore deleted rows without affecting existing data
+#   backparq restore ... --conflict-mode do_nothing
+#
+# Scenario 2: Revert table to backed-up state (overwrite everything)
+#   backparq restore ... --conflict-mode upsert
+#
+# =============================================================================

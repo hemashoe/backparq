@@ -10,6 +10,9 @@ from typing import Optional
 from rich.table import Table
 
 from backparq.config import BackparqConfig
+from backparq.db import connect_pg, pg_count_rows, pg_get_min_created_at, table_exists
+from backparq.storage.parquet import load_manifest
+from backparq.storage.s3 import create_client as s3_client_from_config
 from backparq.utils.console import (
     console,
     format_count,
@@ -18,9 +21,6 @@ from backparq.utils.console import (
     print_success,
     print_warning,
 )
-from backparq.db import connect_pg, pg_count_rows, pg_get_min_created_at, table_exists
-from backparq.storage.parquet import load_manifest
-from backparq.storage.s3 import create_client as s3_client_from_config
 
 logger = logging.getLogger(__name__)
 

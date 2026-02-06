@@ -1,5 +1,3 @@
-"""Retention management and pruning."""
-
 from __future__ import annotations
 
 import datetime as dt
@@ -8,6 +6,7 @@ import logging
 from rich.table import Table
 
 from backparq.config import BackparqConfig
+from backparq.storage.s3 import create_client as s3_client_from_config
 from backparq.utils.console import (
     console,
     create_progress,
@@ -16,7 +15,6 @@ from backparq.utils.console import (
     print_success,
     print_warning,
 )
-from backparq.storage.s3 import create_client as s3_client_from_config
 
 logger = logging.getLogger(__name__)
 

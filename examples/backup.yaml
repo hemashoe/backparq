@@ -1,0 +1,170 @@
+# =============================================================================
+# BACKPARQ - BACKUP MODE CONFIGURATION
+# =============================================================================
+#
+# PURPOSE:
+#   Create full point-in-time snapshots of PostgreSQL tables for disaster
+#   recovery. Unlike offload mode, backup mode NEVER deletes data from the
+#   source database.
+#
+# USE CASE:
+#   - Disaster recovery (restore entire tables after data loss)
+#   - Point-in-time recovery (restore to a specific backup snapshot)
+#   - Compliance (maintain secure copies of critical data)
+#   - Migration (move data between environments)
+#
+# KEY DIFFERENCES FROM OFFLOAD MODE:
+#   - Creates complete table snapshots (no cutoff filtering)
+#   - Each run creates a unique snapshot with Run ID (timestamp)
+#   - perform_delete is NOT allowed (will raise error if set)
+#   - Retention prunes OLD SNAPSHOTS, not data by age
+#
+# HOW TO USE:
+#   1. Copy this file and adjust values for your environment
+#   2. Set environment variables for credentials
+#   3. Test: backparq test --config backup.yaml
+#   4. Execute: backparq archive --config backup.yaml --stats
+#   5. Verify: backparq check --config backup.yaml
+#
+# RESTORE FROM BACKUP:
+#   backparq restore --config backup.yaml \
+#     --backup-id 2024-01-15_120000 \
+#     --start 2024-01-01 --end 2024-12-31
+#
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# DATABASE CONNECTION
+# -----------------------------------------------------------------------------
+database:
+  # REQUIRED: PostgreSQL host
+  host: "${PG_HOST:-localhost}"
+
+  # PostgreSQL port
+  port: 5432
+
+  # REQUIRED: Database name
+  name: "${PG_DATABASE}"
+
+  # REQUIRED: Username
+  user: "${PG_USER:-postgres}"
+
+  # REQUIRED: Password (use environment variable)
+  password: "${PG_PASSWORD}"
+
+  # SSL mode: disable, allow, prefer, require, verify-ca, verify-full
+  sslmode: "prefer"
+
+  # Connection timeout in seconds
+  connect_timeout: 10
+
+# -----------------------------------------------------------------------------
+# S3 STORAGE
+# -----------------------------------------------------------------------------
+s3:
+  # REQUIRED: S3 bucket for backups
+  bucket: "${S3_BUCKET}"
+
+  # Prefix path for backup snapshots
+  # Backups are stored as: {prefix}/backups/{run_id}/{table}/...
+  prefix: "backups"
+
+  # AWS region
+  region: "${AWS_REGION:-us-east-1}"
+
+  # AWS credentials (optional if using IAM roles)
+  access_key_id: "${AWS_ACCESS_KEY_ID}"
+  secret_access_key: "${AWS_SECRET_ACCESS_KEY}"
+
+  # Server-Side Encryption (highly recommended for backups)
+  sse: "aws:kms"
+  kms_key_id: "${KMS_KEY_ID:-alias/backparq-backups}"
+
+  # For S3-compatible storage (MinIO, R2, etc.)
+  # endpoint_url: "https://s3.example.com"
+  # use_ssl: true
+  # verify_ssl: true
+  # addressing_style: "path"
+
+# -----------------------------------------------------------------------------
+# PARQUET FORMAT
+# -----------------------------------------------------------------------------
+parquet:
+  # Compression: zstd (best), snappy (fast), gzip, brotli, lz4, none
+  compression: "zstd"
+
+  # Rows per row group
+  row_group_size: 100000
+
+  # Client-side encryption (optional - adds encryption before S3 upload)
+  encryption:
+    enabled: false
+    # footer_key: "${PARQUET_FOOTER_KEY}"
+    # key_map:
+    #   "k1": "${PARQUET_KEY_1}"
+
+# -----------------------------------------------------------------------------
+# ARCHIVE SETTINGS
+# -----------------------------------------------------------------------------
+archive:
+  # REQUIRED: Must be "backup" for this configuration
+  # Backup mode creates full snapshots without deletion
+  mode: "backup"
+
+  # Local directory for backup files
+  base_dir: "./backparq-data-backup"
+
+  # NOTE: In backup mode, cutoff is NOT used - full tables are backed up
+  # Do NOT set perform_delete: true - it will cause an error
+
+  # Column for ordering data (used for chunking by month)
+  order_by: "created_at"
+
+  # ---------------------------------------------------------------------
+  # PERFORMANCE TUNING
+  # ---------------------------------------------------------------------
+  # Number of tables to backup in parallel
+  concurrency: 4
+
+  # Number of monthly chunks per table in parallel
+  chunk_concurrency: 8
+
+  # Rows per database fetch
+  fetch_size: 100000
+
+  # ---------------------------------------------------------------------
+  # TABLES TO BACKUP
+  # ---------------------------------------------------------------------
+  # All rows from these tables will be included in the backup snapshot.
+  # primary_key is required for restore with conflict resolution.
+  tables:
+    - table: public.users
+      primary_key: id
+
+    - table: public.orders
+      primary_key: order_id
+
+    - table: public.products
+      primary_key: product_id
+
+    - table: public.transactions
+      primary_key: transaction_id
+
+    - table: public.audit_logs
+      primary_key: log_id
+
+  # ---------------------------------------------------------------------
+  # RETENTION POLICY FOR BACKUP SNAPSHOTS
+  # ---------------------------------------------------------------------
+  # Controls how long backup snapshots are kept.
+  # Run: backparq prune --config backup.yaml
+  #
+  # In backup mode, retention deletes OLD SNAPSHOT RUNS (by run_id date),
+  # not individual rows. This limits storage costs while keeping
+  # recent backups accessible.
+  retention:
+    enabled: true
+    days: 30 # Keep 30 days of backup snapshots
+
+
+    # Alternative: months: 1

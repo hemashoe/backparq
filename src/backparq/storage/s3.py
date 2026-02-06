@@ -13,17 +13,27 @@ from backparq.config import S3Config
 
 logger = logging.getLogger(__name__)
 
+# Default timeouts in seconds
+DEFAULT_CONNECT_TIMEOUT = 30
+DEFAULT_READ_TIMEOUT = 60
+
 
 def create_client(config: S3Config):
-    """Create S3 client from configuration."""
-    s3_config = None
+    """Create S3 client from configuration with proper timeouts."""
+    s3_config_kwargs = {
+        "max_pool_connections": 50,
+        "connect_timeout": DEFAULT_CONNECT_TIMEOUT,
+        "read_timeout": DEFAULT_READ_TIMEOUT,
+        "retries": {
+            "max_attempts": 3,
+            "mode": "adaptive",
+        },
+    }
+
     if config.addressing_style:
-        s3_config = Config(
-            s3={"addressing_style": config.addressing_style},
-            max_pool_connections=50,
-        )
-    else:
-        s3_config = Config(max_pool_connections=50)
+        s3_config_kwargs["s3"] = {"addressing_style": config.addressing_style}
+
+    s3_config = Config(**s3_config_kwargs)
 
     session = boto3.session.Session(
         aws_access_key_id=config.access_key_id,
@@ -39,9 +49,6 @@ def create_client(config: S3Config):
         verify=config.verify_ssl,
         config=s3_config,
     )
-
-
-
 
 
 def verify_connection(config: S3Config) -> None:
@@ -91,9 +98,11 @@ def verify_checksum(s3, bucket: str, key: str, expected: str) -> bool:
         return False
 
 
+@retry(stop=stop_after_attempt(5), wait=wait_exponential(multiplier=1, min=2, max=60))
 def download_file(s3, bucket: str, key: str, path: str) -> None:
-    """Download file from S3."""
+    """Download file from S3 with retry on transient failures."""
     s3.download_file(bucket, key, path)
+
 
 
 def list_objects(s3, bucket: str, prefix: str) -> list:

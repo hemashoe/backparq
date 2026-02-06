@@ -12,6 +12,7 @@ from backparq.config import (
     TableConfig,
     _parse_tables,
     load_config,
+    parse_cutoff,
     parse_utc_datetime,
 )
 
@@ -38,6 +39,38 @@ class TestParseUtcDatetime:
         """Test that invalid date raises an exception."""
         with pytest.raises((ConfigError, ValueError)):
             parse_utc_datetime("not-a-date")
+
+
+class TestParseCutoff:
+    """Tests for parse_cutoff function (relative and ISO8601)."""
+
+    def test_parse_relative_days(self):
+        """Test parsing relative days format."""
+        result = parse_cutoff("-30d")
+        assert result is not None
+        # Should be approximately 30 days ago (allow some tolerance)
+        from datetime import datetime, timezone
+
+        now = datetime.now(timezone.utc)
+        delta = (now - result).days
+        assert 29 <= delta <= 31
+
+    def test_parse_relative_months(self):
+        """Test parsing relative months format."""
+        result = parse_cutoff("-6m")
+        assert result is not None
+
+    def test_parse_relative_years(self):
+        """Test parsing relative years format."""
+        result = parse_cutoff("-1y")
+        assert result is not None
+
+    def test_parse_iso8601_fallback(self):
+        """Test that ISO8601 dates still work."""
+        result = parse_cutoff("2024-06-01")
+        assert result.year == 2024
+        assert result.month == 6
+        assert result.day == 1
 
 
 class TestParseTables:
@@ -212,3 +245,27 @@ archive:
             orders_config = config.archive.get_table_config("public.orders")
             assert orders_config is not None
             assert orders_config.primary_key == "order_id"
+
+    def test_load_config_invalid_compression(self):
+        """Test loading config with invalid compression raises ConfigError."""
+        config_yaml = """
+database:
+  host: localhost
+  port: 5432
+  name: testdb
+  user: postgres
+  password: secret
+s3:
+  bucket: my-bucket
+archive:
+  tables: [public.events]
+  mode: offload
+parquet:
+  compression: invalid_codec
+"""
+        with tempfile.NamedTemporaryFile(suffix=".yaml", delete=False, mode="w") as f:
+            f.write(config_yaml)
+            f.flush()
+
+            with pytest.raises(ConfigError, match="Invalid compression"):
+                load_config(Path(f.name))

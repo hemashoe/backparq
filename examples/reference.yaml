@@ -1,0 +1,363 @@
+# =============================================================================
+# BACKPARQ - COMPLETE CONFIGURATION REFERENCE
+# =============================================================================
+#
+# This file documents EVERY available configuration option.
+# Use this as a reference when building your own configuration.
+#
+# ENVIRONMENT VARIABLES:
+#   Use ${VAR_NAME} syntax for any value
+#   Use ${VAR_NAME:-default} for optional defaults
+#   Example: password: "${PG_PASSWORD}"
+#
+# CONFIG INCLUDES:
+#   Split config across files using the 'include' key:
+#   include:
+#     - base.yaml
+#     - secrets.yaml
+#
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# DATABASE CONNECTION
+# -----------------------------------------------------------------------------
+# PostgreSQL connection configuration.
+# All string values support ${ENV_VAR} expansion.
+database:
+  # REQUIRED: PostgreSQL server hostname or IP
+  host: "${PG_HOST:-localhost}"
+
+  # PostgreSQL port number
+  # Type: integer
+  # Default: 5432
+  port: 5432
+
+  # REQUIRED: Name of the database to connect to
+  name: "${PG_DATABASE}"
+
+  # REQUIRED: PostgreSQL username
+  user: "${PG_USER:-postgres}"
+
+  # REQUIRED: PostgreSQL password
+  # Use environment variable for security
+  password: "${PG_PASSWORD}"
+
+  # SSL connection mode
+  # Options:
+  #   - "disable"     : No SSL
+  #   - "allow"       : Try SSL, fall back to non-SSL
+  #   - "prefer"      : Try SSL first (default)
+  #   - "require"     : Require SSL, don't verify certificate
+  #   - "verify-ca"   : Require SSL, verify CA
+  #   - "verify-full" : Require SSL, verify CA and hostname
+  # Default: "" (empty = prefer)
+  sslmode: "prefer"
+
+  # Connection timeout in seconds
+  # Type: integer
+  # Default: 10
+  connect_timeout: 10
+
+# -----------------------------------------------------------------------------
+# S3 STORAGE
+# -----------------------------------------------------------------------------
+# S3 bucket configuration for storing Parquet archives.
+s3:
+  # REQUIRED: S3 bucket name
+  bucket: "${S3_BUCKET}"
+
+  # Prefix (folder path) within the bucket
+  # Archives stored at: {bucket}/{prefix}/archive/{table}/...
+  # Backups stored at: {bucket}/{prefix}/backups/{run_id}/{table}/...
+  # Default: "db-archive"
+  prefix: "postgres-archive"
+
+  # AWS region for the bucket
+  # Type: string (optional)
+  region: "${AWS_REGION:-us-east-1}"
+
+  # AWS access key ID
+  # Optional if using:
+  #   - IAM roles (EC2, ECS, Lambda)
+  #   - ~/.aws/credentials file
+  #   - AWS_ACCESS_KEY_ID environment variable
+  access_key_id: "${AWS_ACCESS_KEY_ID}"
+
+  # AWS secret access key
+  secret_access_key: "${AWS_SECRET_ACCESS_KEY}"
+
+  # AWS session token (for temporary credentials from STS)
+  # session_token: "${AWS_SESSION_TOKEN}"
+
+  # Server-Side Encryption (SSE)
+  # Options:
+  #   - ""          : No encryption
+  #   - "AES256"    : SSE-S3 (Amazon managed keys)
+  #   - "aws:kms"   : SSE-KMS (customer managed keys)
+  # Default: ""
+  sse: "AES256"
+
+  # KMS key ID or alias (required if sse is "aws:kms")
+  # Examples:
+  #   - "alias/my-key"
+  #   - "arn:aws:kms:us-east-1:123456789:key/12345678-1234-..."
+  #   - "12345678-1234-1234-1234-123456789abc"
+  # kms_key_id: "alias/backparq-key"
+
+  # Custom S3 endpoint URL (for S3-compatible storage)
+  # Use for: MinIO, Cloudflare R2, DigitalOcean Spaces, Wasabi, etc.
+  # endpoint_url: "https://s3.example.com"
+  # endpoint_url: "http://localhost:9000"  # MinIO local
+
+  # Use SSL for S3 connections
+  # Type: boolean
+  # Default: true
+  # use_ssl: true
+
+  # Verify SSL certificate
+  # Type: boolean
+  # Default: true
+  # Set to false for self-signed certs (development only)
+  # verify_ssl: true
+
+  # S3 addressing style
+  # Options:
+  #   - "virtual" : bucket.s3.amazonaws.com (default for AWS)
+  #   - "path"    : s3.amazonaws.com/bucket (required for MinIO)
+  #   - "auto"    : Let boto3 decide
+  # addressing_style: "path"
+
+# -----------------------------------------------------------------------------
+# PARQUET FORMAT
+# -----------------------------------------------------------------------------
+# Output Parquet file configuration.
+parquet:
+  # Compression algorithm
+  # Options: snappy, gzip, brotli, lz4, zstd, none
+  #
+  # Recommendations:
+  #   - "zstd"   : Best compression ratio, good speed (recommended)
+  #   - "snappy" : Fastest, moderate compression (good for large datasets)
+  #   - "gzip"   : Good compression, slower, most compatible
+  #   - "none"   : No compression (testing only)
+  #
+  # Default: "zstd"
+  compression: "zstd"
+
+  # Rows per row group in Parquet file
+  # Type: integer
+  # Default: 100000
+  #
+  # Trade-offs:
+  #   - Higher: Better compression, more memory, slower random access
+  #   - Lower: Faster random access, less compression, more metadata
+  #
+  # Recommendations:
+  #   - 100,000 - 1,000,000 for analytics workloads
+  #   - 10,000 - 50,000 for frequent queries on specific rows
+  row_group_size: 100000
+
+  # Client-Side Encryption (Parquet Modular Encryption)
+  # Encrypts Parquet files BEFORE uploading to S3.
+  # Provides defense-in-depth on top of S3 SSE.
+  encryption:
+    # Enable client-side encryption
+    # Type: boolean
+    # Default: false
+    enabled: false
+
+    # Footer encryption key (Base64-encoded 32-byte key)
+    # Required if enabled: true
+    # Generate with: openssl rand -base64 32
+    # footer_key: "${PARQUET_FOOTER_KEY}"
+
+    # Key map: Maps key IDs to key material
+    # Required if enabled: true
+    # key_map:
+    #   "k1": "${PARQUET_KEY_1}"
+    #   "k2": "${PARQUET_KEY_2}"
+
+    # Column-level encryption: Map columns to key IDs
+    # Different columns can use different keys
+    # column_keys:
+    #   "public.users.ssn": "k1"
+    #   "public.billing.credit_card": "k2"
+
+# -----------------------------------------------------------------------------
+# ARCHIVE SETTINGS
+# -----------------------------------------------------------------------------
+# Core archiving behavior configuration.
+archive:
+  # Operation mode
+  # REQUIRED
+  # Options:
+  #   - "offload" : Archive old data, optionally delete from DB
+  #   - "backup"  : Full snapshots for disaster recovery (no deletion)
+  mode: "offload"
+
+  # Local directory for Parquet files and manifests
+  # Default: "./backparq-data"
+  base_dir: "./backparq-data"
+
+  # Column for ordering and filtering data by age
+  # Must be a timestamp/date column for proper partitioning
+  # Default: "created_at"
+  order_by: "created_at"
+
+  # -------------------------------------------------------------------------
+  # CUTOFF DATE (Offload mode only)
+  # -------------------------------------------------------------------------
+  # Only data OLDER than this is archived.
+  # Ignored in backup mode (full table backup).
+  #
+  # RELATIVE FORMATS (recommended):
+  #   -30d  = 30 days ago
+  #   -90d  = 90 days ago
+  #   -6m   = 6 months ago (180 days)
+  #   -1y   = 1 year ago (365 days)
+  #   -2w   = 2 weeks ago
+  #
+  # ABSOLUTE FORMATS (ISO8601):
+  #   "2024-01-01"
+  #   "2024-06-15T00:00:00Z"
+  cutoff: "-30d"
+
+  # Alternative key name (same behavior)
+  # cutoff_exclusive: "-30d"
+
+  # -------------------------------------------------------------------------
+  # DELETION SETTINGS
+  # -------------------------------------------------------------------------
+  # ⚠️  DANGER: Data is PERMANENTLY deleted from PostgreSQL!
+  #
+  # Deletion only occurs AFTER:
+  #   1. Parquet file successfully written
+  #   2. SHA256 checksum calculated
+  #   3. S3 upload completed
+  #   4. S3 object checksum verified
+  #
+  # Type: boolean
+  # Default: false
+  perform_delete: false
+
+  # Rows to delete per transaction
+  # Smaller batches = less lock contention, more transactions
+  # Type: integer
+  # Default: 10000
+  delete_batch_size: 10000
+
+  # Run VACUUM after deletion
+  # Reclaims disk space but can be resource intensive
+  # Type: boolean
+  # Default: false
+  vacuum: false
+
+  # -------------------------------------------------------------------------
+  # CONCURRENCY
+  # -------------------------------------------------------------------------
+  # Number of tables to process in parallel
+  # Type: integer
+  # Default: 1
+  concurrency: 2
+
+  # Number of monthly chunks per table to process in parallel
+  # Type: integer
+  # Default: 1
+  chunk_concurrency: 4
+
+  # -------------------------------------------------------------------------
+  # STREAMING
+  # -------------------------------------------------------------------------
+  # Rows to fetch per database cursor batch
+  # Controls memory usage during data streaming
+  # Type: integer
+  # Default: 10000
+  fetch_size: 50000
+
+  # -------------------------------------------------------------------------
+  # SAFETY FLAGS
+  # -------------------------------------------------------------------------
+  # Simulate operations without making changes
+  # Type: boolean
+  # Default: false
+  dry_run: false
+
+  # Re-archive existing chunks (overwrites files)
+  # Type: boolean
+  # Default: false
+  overwrite: false
+
+  # -------------------------------------------------------------------------
+  # TABLES
+  # -------------------------------------------------------------------------
+  # List of tables to archive/backup.
+  #
+  # SIMPLE FORMAT (uses default primary_key "id"):
+  #   tables:
+  #     - public.events
+  #     - public.logs
+  #
+  # ADVANCED FORMAT:
+  #   tables:
+  #     - table: public.orders
+  #       primary_key: order_id
+  #       order_by: created_at
+  #       masking:
+  #         email: hash      # SHA256 hash
+  #         phone: redact    # Replace with "REDACTED"
+  #         ssn: "null"      # Set to NULL
+  tables:
+    - public.events
+
+    - table: public.audit_logs
+      primary_key: log_id
+      order_by: timestamp
+      masking:
+        email: hash
+        ip_address: redact
+
+  # -------------------------------------------------------------------------
+  # RETENTION POLICY
+  # -------------------------------------------------------------------------
+  # Configure automatic pruning of old archives/backups.
+  # Run: backparq prune --config config.yaml
+  #
+  # In offload mode: Deletes archives older than X days
+  # In backup mode: Deletes backup snapshots older than X days
+  retention:
+    # Enable retention-based pruning
+    # Type: boolean
+    # Default: false
+    enabled: true
+
+    # Keep data for this many days
+    # Type: integer
+    # Default: 0
+    days: 365
+
+    # Keep data for this many months (converted to days * 30)
+    # Type: integer
+    # Default: 0
+    # months: 12
+
+# -----------------------------------------------------------------------------
+# CRON SCHEDULING (DEPRECATED)
+# -----------------------------------------------------------------------------
+# Note: The 'apply' command and cron scheduling are deprecated.
+# Use external schedulers (cron, Airflow, Cloud Scheduler) instead.
+# cron:
+#   enabled: false
+#   schedule: "0 2 * * *"   # Every day at 2 AM
+#   command: ""             # Custom command to run
+
+# -----------------------------------------------------------------------------
+# NOTIFICATIONS (OPTIONAL)
+# -----------------------------------------------------------------------------
+# Webhook notifications on job completion.
+# notifications:
+#   enabled: true
+#   urls:
+#     - "https://hooks.slack.com/services/..."
+#     - "https://api.pagerduty.com/..."
+#   on_success: true
+#   on_failure: true

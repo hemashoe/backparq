@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "backparq"
-version = "0.3.0"
-description = "Archive PostgreSQL tables to Parquet files on S3 with safety, restore, and retention management."
+version = "0.4.0"
+description = "PostgreSQL backup and archive to Parquet on S3. Offload cold data, full snapshots, point-in-time restore."
 readme = "README.md"
 requires-python = ">=3.8"
 license = "MIT"
@@ -17,12 +17,14 @@ keywords = [
     "backup",
     "archive",
     "data-lake",
+    "data-archiving",
     "etl",
     "database",
     "aws",
+    "minio",
 ]
 authors = [
-    { name = "Backparq Contributors", email = "maksathemdemovv@gmail.com" }
+    { name = "Backparq Contributors", email = "thehighestintheroom00@gmail.com" }
 ]
 classifiers = [
     "Development Status :: 4 - Beta",
@@ -32,6 +34,7 @@ classifiers = [
     "License :: OSI Approved :: MIT License",
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
     "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
@@ -60,11 +63,9 @@ dev = [
     "testcontainers[postgres,minio]>=3.7.0",
 ]
 query = ["duckdb>=0.9.0"]
-metrics = ["prometheus-client>=0.18.0"]
 notifications = ["httpx>=0.25.0"]
 all = [
     "duckdb>=0.9.0",
-    "prometheus-client>=0.18.0",
     "httpx>=0.25.0",
 ]
 
@@ -140,5 +141,13 @@ select = [
 ]
 ignore = [
     "E501",   # line too long (handled by formatter)
+    "E402",   # module level import not at top (some files use mid-file imports)
     "B008",   # do not perform function calls in argument defaults
+    "UP045",  # Optional[X] vs X | None (py39 compatibility)
+    "F401",   # unused imports (re-exports)
 ]
+
+[tool.ruff.lint.per-file-ignores]
+# plan.py has variables for planned future use
+"src/backparq/plan.py" = ["F841"]
+

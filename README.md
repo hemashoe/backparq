@@ -1,126 +1,158 @@
 # Backparq
 
-**Production-grade PostgreSQL Archival and Backup Tool.**
+**Table-level PostgreSQL Backup to Parquet on S3.**
 
-Backparq efficiently archives PostgreSQL tables to Parquet files on S3. It is designed for high-performance data offloading (archiving) and full disaster recovery backups, with a strong emphasis on data safety, verification, and ease of use.
+Backparq exports PostgreSQL tables as Parquet files to S3, enabling fast restores, columnar analytics, and long-term retention at a fraction of the cost of keeping data in your database.
 
+[![CI](https://github.com/hemashoe/backparq/actions/workflows/ci.yml/badge.svg)](https://github.com/hemashoe/backparq/actions/workflows/ci.yml)
 [![Python 3.8+](https://img.shields.io/badge/python-3.8%2B-blue.svg)](https://www.python.org/)
 [![PyPI](https://img.shields.io/pypi/v/backparq.svg)](https://pypi.org/project/backparq/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-## 🚀 Key Features
+## Why Backparq?
 
-*   **Two Operation Modes**:
-    *   **Offload (Archive) Mode**: Moves "cold" data (older than X days) to S3 and safely deletes it from the database to save space and improve performance.
-    *   **Backup Mode**: Creates full, point-in-time snapshots of tables for disaster recovery without modifying source data.
-*   **Performance**:
-    *   **Parallel Processing**: Concurrent processing at both table and chunk levels.
-    *   **Connection Pooling**: Efficient database connection management for high concurrency.
-    *   **Streaming**: Uses server-side cursors to stream data, keeping memory usage constant regardless of table size.
-*   **Safety First**:
-    *   **Checksum Verification**: SHA256 checksums are computed and verified after every upload *before* any data is deleted from the source.
-    *   **Graceful Shutdown**: Handles OS signals (SIGINT/SIGTERM) to stop cleanly without data corruption.
-    *   **Atomic Operations**: Data is deleted in consistent batches only after successful verification.
-*   **Restoration**:
-    *   **Point-in-Time Restore**: Restore data for specific date ranges.
-    *   **Conflict Resolution**: Choose between `do_nothing` (skip existing) or `upsert` (update existing) on restore.
-    *   **Schema Evolution**: Automatically handles scenarios where the archive has columns that have been dropped from the live database.
-*   **Observability**:
-    *   **Rich CLI**: Progress bars, colored status updates, and statistics.
-    *   **Structured Logging**: JSON logging support for integration with log aggregators (ELK, Datadog, etc.).
-    *   **Verification**: Dedicated `check` and `verify` commands to audit S3 archives.
+| Problem | How Backparq Solves It |
+|---------|------------------------|
+| **Database growing too large** | Archive old data to S3, optionally delete from PostgreSQL |
+| **Need table-level backups** | Full or incremental snapshots per table, not whole database |
+| **Want to query historical data** | Parquet format works with DuckDB, Athena, Spark, Pandas |
+| **Slow restores from pg_dump** | Restore specific tables and date ranges in minutes |
+| **No visibility into backups** | SHA256 checksums, verification commands, progress bars |
 
-## 📦 Installation
+## Backparq vs WAL-G vs pg_dump
+
+| | **pg_dump** | **WAL-G** | **Backparq** |
+|---|-------------|-----------|--------------|
+| **Backup Scope** | Full database | Full database (WAL + base) | Per-table, selectable |
+| **Backup Format** | SQL / custom binary | WAL segments + base backup | Parquet (columnar) |
+| **Incremental** | No | Yes (WAL streaming) | Yes (by date ranges) |
+| **Restore Granularity** | Entire DB or single table | Point-in-time (whole DB) | Per-table + date range |
+| **Query Backups Directly** | No | No | Yes (DuckDB/Athena/Spark) |
+| **Storage Efficiency** | Low (uncompressed SQL) | Medium | High (columnar + zstd) |
+| **S3 Native** | Via pipe/script | Yes | Yes |
+| **Use Case** | Migrations, full dumps | Continuous DR, PITR | Table archival, analytics-ready backups |
+
+### When to Use Each
+
+- **pg_dump**: One-off migrations, development snapshots, schema exports
+- **WAL-G**: Continuous disaster recovery, point-in-time recovery to any second
+- **Backparq**: Table-level backups, cold data archival, analytics on historical data
+
+**Best practice**: Use WAL-G for continuous DR + Backparq for table-level archival and analytics.
+
+## Features
+
+- **Two Modes**: Backup (full snapshots) or Offload (archive + delete old data)
+- **Table Selection**: Choose specific tables, not the entire database
+- **Date-Range Restore**: Restore only the data you need, not everything
+- **Columnar Format**: Query backups directly with DuckDB, Athena, or Spark
+- **Parallel Processing**: Concurrent table and chunk processing
+- **Streaming Export**: Constant memory usage regardless of table size
+- **Safety First**: SHA256 checksums verified before any deletion
+- **Encryption**: S3 SSE-S3, SSE-KMS, or client-side Parquet encryption
+
+## Installation
 
 ```bash
+# Recommended: use uv
+curl -LsSf https://astral.sh/uv/install.sh | sh
+uv pip install backparq
+
+# Or pip
 pip install backparq
+
+# With DuckDB for querying archives
+uv pip install backparq[query]
 ```
 
-With optional features:
+## Quick Start
 
 ```bash
-pip install backparq[all]      # All optional dependencies
-pip install backparq[query]    # DuckDB for querying archives
-pip install backparq[metrics]  # Prometheus metrics
+# 1. Generate config
+backparq init
+
+# 2. Test connections
+backparq test --config backparq.yaml
+
+# 3. Run backup (preview)
+backparq archive --config backparq.yaml --dry-run
+
+# 4. Run backup
+backparq archive --config backparq.yaml --stats
 ```
 
-## 🛠️ Quick Start
+## Usage
 
-1.  **Generate a configuration file**:
-    ```bash
-    backparq init
-    ```
+### Backup Tables
 
-2.  **Test connections** to Database and S3:
-    ```bash
-    backparq test --config backparq.yaml
-    ```
-
-3.  **Run an Archive** (Offload old data):
-    ```bash
-    # Dry run to see what would happen
-    backparq archive --config backparq.yaml --dry-run
-    
-    # Execute with statistics
-    backparq archive --config backparq.yaml --stats
-    ```
-
-## 📖 Usage & Commands
-
-```text
-usage: backparq [-h] [-v] {test,archive,restore,check,prune,status,verify,init} ...
-```
-
-### 1. Archiving (Offloading)
-Moves data older than a cutoff date to S3 and deletes it from PostgreSQL.
+Create full snapshots of specific tables:
 
 ```bash
-backparq archive --config backparq_offload.yaml --stats
+backparq archive --config backup.yaml --stats
 ```
-*   **Config tip**: Set `mode: offload` and `perform_delete: true`.
 
-### 2. Backup
-Takes a full snapshot of the table. Does not delete data.
+```yaml
+# backup.yaml
+archive:
+  mode: backup           # Full snapshot, no deletion
+  tables:
+    - public.users
+    - public.orders
+    - public.transactions
+```
+
+### Archive + Delete Old Data
+
+Move data older than 90 days to S3 and reclaim database space:
 
 ```bash
-backparq archive --config backparq_backup.yaml --stats
+backparq archive --config offload.yaml --stats
 ```
-*   Creates a snapshot under a unique Run ID (timestamp).
-*   **Config tip**: Set `mode: backup`.
 
-### 3. Restore
-Restores data from S3 back to PostgreSQL.
+```yaml
+# offload.yaml
+archive:
+  mode: offload
+  cutoff: "-90d"         # Archive data older than 90 days
+  perform_delete: true   # Delete after verified S3 upload
+  tables:
+    - public.events
+    - public.audit_logs
+```
+
+### Restore
 
 ```bash
 # Restore specific date range
-backparq restore --config backparq.yaml --start 2024-01-01 --end 2024-02-01
+backparq restore --config restore.yaml \
+  --start 2024-01-01 --end 2024-03-01
 
 # Restore from a specific backup snapshot
-backparq restore --config backparq.yaml --backup-id 2024-01-15_120000 --start 2024-01-01 --end 2024-01-02
+backparq restore --config restore.yaml \
+  --backup-id 2024-01-15_120000
 
-# Handle conflicts by updating existing rows
-backparq restore --config backparq.yaml --start 2024-01-01 --end 2024-01-02 --conflict-mode upsert
+# Update existing rows with archived data
+backparq restore ... --conflict-mode upsert
 ```
 
-### 4. Verification & Maintenance
-Start `check` to quickly list archives, or `verify` for a deep content check.
+### Query Archives Directly
 
 ```bash
-# List archives in S3
-backparq check --config backparq.yaml
-
-# verify integrity of all archives (downloads and checks headers)
-backparq verify --config backparq.yaml
-
-# Delete old backups based on retention policy
-backparq prune --config backparq.yaml
+# Query with DuckDB (requires backparq[query])
+backparq query --config backparq.yaml \
+  --sql "SELECT COUNT(*) FROM public_orders WHERE created_at > '2024-01-01'"
 ```
 
-## ⚙️ Configuration
+### Verify & Maintain
 
-Configuration is YAML-based. You can use environment variables like `${VAR_NAME}` for sensitive values.
+```bash
+backparq check --config backparq.yaml   # List archives
+backparq verify --config backparq.yaml  # Verify checksums
+backparq prune --config backparq.yaml   # Delete old backups per retention
+```
 
-### Minimal Example
+## Configuration
+
 ```yaml
 database:
   host: localhost
@@ -129,41 +161,47 @@ database:
   password: "${PG_PASSWORD}"
 
 s3:
-  bucket: my-company-backups
-  prefix: app-data
+  bucket: my-backups
+  prefix: postgres
   region: us-east-1
+  sse: "AES256"  # Server-side encryption
 
 archive:
-  mode: offload
+  mode: backup   # or "offload"
   tables:
-    - public.events
-    - public.audit_logs
+    - table: public.orders
+      primary_key: order_id
 ```
 
-### Full Configuration Reference
+See [`examples/reference.yaml`](examples/reference.yaml) for all options.
 
-See [backparq_full_example.yaml](examples/backparq_full_example.yaml) for a completely documented configuration file covering encryption, compression, retention policies, and advanced S3 settings.
+## Example Configs
 
-## 🛡️ Security
+| File | Use Case |
+|------|----------|
+| [`examples/backup.yaml`](examples/backup.yaml) | Full table snapshots for DR |
+| [`examples/offload.yaml`](examples/offload.yaml) | Archive old data + delete from DB |
+| [`examples/restore.yaml`](examples/restore.yaml) | Restore with date ranges |
+| [`examples/reference.yaml`](examples/reference.yaml) | All configuration options |
 
-*   **Identities**: Use IAM roles or environment variables. API keys are supported but recommended via env vars.
-*   **Encryption**: Backparq supports S3 Server-Side Encryption (SSE-S3, SSE-KMS) and Client-Side Parquet encryption.
-*   **Network**: Runs inside your infrastructure; no data is sent to Backparq servers.
+## Security
 
-## 🤝 Contributing
+- **Credentials**: IAM roles, environment variables, or AWS credentials file
+- **Encryption at rest**: S3 SSE-S3, SSE-KMS, or client-side Parquet encryption
+- **Encryption in transit**: HTTPS to S3
+- **Checksums**: SHA256 verification before any deletion
 
-We welcome contributions!
+See [SECURITY.md](SECURITY.md) for vulnerability reporting.
+
+## Contributing
 
 ```bash
-# Install dev environment
-pip install -e ".[dev]"
-
-# Run tests
-pytest
-
-# Linting
-ruff check src/
+uv venv && source .venv/bin/activate
+uv pip install -e ".[dev]"
+uv run pytest
 ```
+
+See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License
 
