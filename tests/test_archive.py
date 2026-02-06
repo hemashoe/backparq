@@ -11,8 +11,6 @@ import pytest
 from backparq.archive import (
     _s3_extra_args,
     chunk_paths,
-    is_shutdown_requested,
-    request_shutdown,
     s3_key_for_chunk,
 )
 from backparq.db import ChunkSpec
@@ -84,31 +82,6 @@ class TestS3KeyForChunk:
 
         with pytest.raises(ValueError, match="run_id"):
             s3_key_for_chunk("db-archive", chunk, "backup")
-
-
-class TestShutdownHandling:
-    """Tests for graceful shutdown handling."""
-
-    def test_shutdown_flag_default_false(self):
-        """Test shutdown flag is False by default."""
-        # Reset the flag
-        from backparq.archive import _shutdown_requested
-
-        _shutdown_requested.clear()
-
-        assert not is_shutdown_requested()
-
-    def test_request_shutdown_sets_flag(self):
-        """Test request_shutdown sets the flag."""
-        from backparq.archive import _shutdown_requested
-
-        _shutdown_requested.clear()
-
-        request_shutdown()
-        assert is_shutdown_requested()
-
-        # Clean up
-        _shutdown_requested.clear()
 
 
 class TestS3ExtraArgs:

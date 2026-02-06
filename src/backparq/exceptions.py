@@ -1,5 +1,3 @@
-"""Exception hierarchy for backparq."""
-
 from __future__ import annotations
 
 

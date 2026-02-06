@@ -2,7 +2,6 @@
 Unit tests for backparq.cli module.
 """
 
-
 import pytest
 
 from backparq.cli import (

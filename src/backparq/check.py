@@ -5,10 +5,12 @@ from __future__ import annotations
 import json
 import logging
 from collections import defaultdict
+from typing import Any
 
 from rich.table import Table
 
 from backparq.config import BackparqConfig
+from backparq.storage.s3 import create_client as s3_client_from_config
 from backparq.utils.console import (
     console,
     format_count,
@@ -17,13 +19,12 @@ from backparq.utils.console import (
     print_success,
     print_warning,
 )
-from backparq.storage.s3 import create_client as s3_client_from_config
 
 logger = logging.getLogger(__name__)
 
 
 def check_backups(config: BackparqConfig, output_json: bool = False) -> dict:
-    result = {"backups": [], "summary": {}}
+    result: dict[str, Any] = {"backups": [], "summary": {}}
 
     if not config.s3.bucket:
         print_warning("No S3 bucket configured")
@@ -113,7 +114,7 @@ def check_backups(config: BackparqConfig, output_json: bool = False) -> dict:
 
 
 def _parse_backup_key(key: str, prefix: str) -> dict:
-    info = {"key": key, "table": None, "year": None, "month": None, "mode": None}
+    info: dict[str, Any] = {"key": key, "table": None, "year": None, "month": None, "mode": None}
     path = key[len(prefix) :].lstrip("/")
     parts = path.split("/")
 

@@ -9,6 +9,8 @@ import pytest
 
 from backparq.storage.s3 import (
     verify_checksum as s3_verify_object_sha256,
+)
+from backparq.storage.s3 import (
     verify_connection as verify_s3_connection,
 )
 

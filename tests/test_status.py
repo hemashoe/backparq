@@ -1,9 +1,7 @@
 """Tests for the status module."""
 
-
-
-from backparq.utils.console import format_count, format_size
 from backparq.status import _get_local_stats
+from backparq.utils.console import format_count, format_size
 
 
 class TestFormatSize:

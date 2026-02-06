@@ -1,10 +1,3 @@
-"""
-Backparq Configuration Module
-
-Handles loading, parsing, and validating YAML configuration files.
-Supports environment variable expansion and config file includes.
-"""
-
 from __future__ import annotations
 
 import datetime as dt
@@ -24,7 +17,7 @@ DEFAULT_BASE_DIR = Path.cwd() / "backparq-data"
 DEFAULT_CUTOFF_EXCLUSIVE = ""  # Empty means no cutoff (full table)
 DEFAULT_S3_PREFIX = "db-archive"
 DEFAULT_ORDER_BY = "created_at"
-DEFAULT_COMPRESSION = "snappy"
+DEFAULT_COMPRESSION = "zstd"
 DEFAULT_PRIMARY_KEY = "id"
 
 
@@ -139,7 +132,7 @@ class ArchiveConfig:
     vacuum: bool = False
     retention: RetentionConfig = field(default_factory=RetentionConfig)
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         if self.mode not in ("backup", "offload"):
             raise ConfigError(f"Invalid mode '{self.mode}'. Must be 'backup' or 'offload'.")
         if self.mode == "backup" and self.perform_delete:
@@ -173,7 +166,7 @@ class CronConfig:
 @dataclass(frozen=True)
 class NotificationConfig:
     """Notification configuration."""
-    
+
     enabled: bool = False
     urls: list[str] = field(default_factory=list)
     on_success: bool = False
@@ -197,6 +190,9 @@ class BackparqConfig:
 # =============================================================================
 
 
+_RELATIVE_CUTOFF = re.compile(r"^(-?\d+)([dDwWmMyY])$")
+
+
 def parse_utc_datetime(value: str) -> dt.datetime:
     """Parse a datetime string to UTC timezone-aware datetime."""
     if not value:
@@ -210,12 +206,39 @@ def parse_utc_datetime(value: str) -> dt.datetime:
     return parsed.astimezone(dt.timezone.utc)
 
 
+def parse_cutoff(value: str) -> dt.datetime:
+    """
+    Parse cutoff as ISO8601 date or relative format.
+
+    Relative formats: -30d (30 days ago), -90d, -6m (6 months), -1y (1 year).
+    Supports: d/days, w/weeks, m/months, y/years. Negative = past.
+    """
+    if not value:
+        raise ConfigError("Empty cutoff string")
+    value = value.strip()
+    match = _RELATIVE_CUTOFF.match(value)
+    if match:
+        num = int(match.group(1))
+        unit = match.group(2).lower()
+        now = dt.datetime.now(dt.timezone.utc)
+        if unit in ("d",):
+            return now - dt.timedelta(days=abs(num))
+        if unit in ("w",):
+            return now - dt.timedelta(weeks=abs(num))
+        if unit in ("m",):
+            # Approximate: 30 days per month
+            return now - dt.timedelta(days=abs(num) * 30)
+        if unit in ("y",):
+            return now - dt.timedelta(days=abs(num) * 365)
+    return parse_utc_datetime(value)
+
+
 def _require_section(data: dict[str, Any], key: str) -> dict[str, Any]:
     """Require a config section to exist and be a dict."""
     value = data.get(key)
-    if value is None or not isinstance(value, dict):
-        raise ConfigError(f"Missing or invalid '{key}' section in config.")
-    return value
+    if isinstance(value, dict):
+        return value
+    raise ConfigError(f"Missing or invalid '{key}' section in config.")
 
 
 def _require_str(data: dict[str, Any], key: str) -> str:
@@ -321,8 +344,15 @@ def _parse_parquet(data: dict[str, Any]) -> ParquetConfig:
         key_map=_optional_str_map(encryption_data, "key_map"),
     )
 
+    compression = _optional_str(data, "compression", DEFAULT_COMPRESSION).lower()
+    allowed_compressions = {"snappy", "gzip", "brotli", "lz4", "zstd", "none"}
+    if compression not in allowed_compressions:
+        raise ConfigError(
+            f"Invalid compression '{compression}'. Allowed: {', '.join(sorted(allowed_compressions))}"
+        )
+
     return ParquetConfig(
-        compression=_optional_str(data, "compression", DEFAULT_COMPRESSION),
+        compression=compression,
         row_group_size=_optional_int(data, "row_group_size", 100_000),
         encryption=encryption,
     )
@@ -365,7 +395,9 @@ def _parse_tables(tables_data: list) -> list[TableConfig]:
                 raise ConfigError("Table config must have 'table' or 'name' key with string value.")
             pk = _optional_str(item, "primary_key", DEFAULT_PRIMARY_KEY)
             masking = _optional_str_map(item, "masking")
-            parsed_tables.append(TableConfig(name=table_name.strip(), primary_key=pk, masking=masking))
+            parsed_tables.append(
+                TableConfig(name=table_name.strip(), primary_key=pk, masking=masking)
+            )
         else:
             raise ConfigError(f"Invalid table entry: {item}. Must be string or dict.")
 
@@ -377,9 +409,10 @@ def _parse_archive(data: dict[str, Any]) -> ArchiveConfig:
     tables = _parse_tables(data.get("tables", []))
     mode = _optional_str(data, "mode", "offload").lower()
 
-    # Cutoff is optional - empty means no cutoff (process all data)
-    cutoff_raw = _optional_str(data, "cutoff_exclusive", "")
-    cutoff = parse_utc_datetime(cutoff_raw) if cutoff_raw else None
+    # Cutoff is optional - supports cutoff or cutoff_exclusive (alias)
+    # Formats: ISO8601 (2024-01-15) or relative (-30d, -90d, -6m, -1y)
+    cutoff_raw = _optional_str(data, "cutoff_exclusive", "") or _optional_str(data, "cutoff", "")
+    cutoff = parse_cutoff(cutoff_raw) if cutoff_raw else None
 
     # Base directory - configurable, defaults to ./backparq-data
     base_dir_str = _optional_str(data, "base_dir", str(DEFAULT_BASE_DIR))
@@ -429,11 +462,11 @@ def _parse_notifications(data: Optional[dict[str, Any]]) -> Optional[Notificatio
     """Parse notification configuration section."""
     if not data:
         return None
-        
+
     urls = data.get("urls", [])
     if isinstance(urls, str):
         urls = [urls]
-        
+
     return NotificationConfig(
         enabled=True,
         urls=[u for u in urls if isinstance(u, str) and u],

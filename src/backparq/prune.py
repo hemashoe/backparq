@@ -1,13 +1,13 @@
-"""Retention management and pruning."""
-
 from __future__ import annotations
 
 import datetime as dt
 import logging
+from typing import TypedDict
 
 from rich.table import Table
 
 from backparq.config import BackparqConfig
+from backparq.storage.s3 import create_client as s3_client_from_config
 from backparq.utils.console import (
     console,
     create_progress,
@@ -16,13 +16,22 @@ from backparq.utils.console import (
     print_success,
     print_warning,
 )
-from backparq.storage.s3 import create_client as s3_client_from_config
 
 logger = logging.getLogger(__name__)
 
 
-def prune_backups(config: BackparqConfig, dry_run: bool = False) -> dict:
-    result = {"deleted": [], "summary": {"files_deleted": 0, "bytes_freed": 0}}
+class PruneSummary(TypedDict):
+    files_deleted: int
+    bytes_freed: int
+
+
+class PruneResult(TypedDict):
+    deleted: list[str]
+    summary: PruneSummary
+
+
+def prune_backups(config: BackparqConfig, dry_run: bool = False) -> PruneResult:
+    result: PruneResult = {"deleted": [], "summary": {"files_deleted": 0, "bytes_freed": 0}}
 
     if not config.archive.retention.enabled:
         print_warning("Retention disabled")

@@ -1,5 +1,3 @@
-"""Logging configuration."""
-
 from __future__ import annotations
 
 import json
@@ -15,12 +13,12 @@ _context = threading.local()
 def get_correlation_id() -> str:
     if not hasattr(_context, "correlation_id"):
         _context.correlation_id = str(uuid.uuid4())[:8]
-    return _context.correlation_id
+    return str(_context.correlation_id)
 
 
 def set_correlation_id(correlation_id: Optional[str] = None) -> str:
     _context.correlation_id = correlation_id or str(uuid.uuid4())[:8]
-    return _context.correlation_id
+    return str(_context.correlation_id)
 
 
 def log_with_data(logger: logging.Logger, level: int, msg: str, **kwargs: Any) -> None:

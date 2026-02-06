@@ -1,12 +1,14 @@
-"""Verify archived data integrity."""
-
 from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 from backparq.config import BackparqConfig
+from backparq.models import VerifyResult
+from backparq.storage.parquet import compute_sha256, load_manifest
+from backparq.storage.s3 import create_client as s3_client_from_config
+from backparq.storage.s3 import verify_checksum as s3_verify_object_sha256
 from backparq.utils.console import (
     console,
     create_progress,
@@ -15,9 +17,6 @@ from backparq.utils.console import (
     print_success,
     print_warning,
 )
-from backparq.models import VerifyResult
-from backparq.storage.parquet import load_manifest, compute_sha256
-from backparq.storage.s3 import create_client as s3_client_from_config, verify_checksum as s3_verify_object_sha256
 
 logger = logging.getLogger(__name__)
 
@@ -116,7 +115,7 @@ def verify_archives(
     return result
 
 
-def _repair_from_s3(s3, config: BackparqConfig, local_path: Path, manifest: dict) -> bool:
+def _repair_from_s3(s3: Any, config: BackparqConfig, local_path: Path, manifest: dict) -> bool:
     s3_key = manifest.get("s3_key", "")
     if not s3_key:
         return False
@@ -129,7 +128,7 @@ def _repair_from_s3(s3, config: BackparqConfig, local_path: Path, manifest: dict
 
 
 def _repair_to_s3(
-    s3, config: BackparqConfig, local_path: Path, s3_key: str, expected_sha: str
+    s3: Any, config: BackparqConfig, local_path: Path, s3_key: str, expected_sha: str
 ) -> bool:
     try:
         s3.upload_file(

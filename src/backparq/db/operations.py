@@ -1,17 +1,11 @@
-"""
-Backparq Database Module
-
-Handles PostgreSQL connections, data export, and deletion operations.
-Uses parameterized queries to prevent SQL injection.
-"""
-
 from __future__ import annotations
 
 import datetime as dt
 import logging
 import time
 from dataclasses import dataclass
-from typing import Optional
+from pathlib import Path
+from typing import Any, Optional
 
 import psycopg2
 import psycopg2.extensions
@@ -19,7 +13,7 @@ import psycopg2.extras
 from psycopg2 import sql
 from tenacity import retry, stop_after_attempt, wait_exponential
 
-from backparq.config import DatabaseConfig
+from backparq.config import BackparqConfig, DatabaseConfig
 
 logger = logging.getLogger(__name__)
 
@@ -53,7 +47,7 @@ def _table_identifier(table: str) -> sql.Composable:
 
 
 @retry(stop=stop_after_attempt(5), wait=wait_exponential(multiplier=1, min=2, max=30))
-def connect_pg(config: DatabaseConfig):
+def connect_pg(config: DatabaseConfig) -> psycopg2.extensions.connection:
     """Create a PostgreSQL connection with retry logic."""
     logger.debug(f"Connecting to {config.host}:{config.port}/{config.name}")
     conn = psycopg2.connect(config.dsn())
@@ -74,7 +68,7 @@ def test_pg_connection(config: DatabaseConfig) -> None:
         conn.close()
 
 
-def table_exists(conn, table: str) -> bool:
+def table_exists(conn: Any, table: str) -> bool:
     """Check if a table exists in the database."""
     schema, table_name = _parse_table_name(table)
     if schema:
@@ -84,7 +78,7 @@ def table_exists(conn, table: str) -> bool:
                 WHERE table_schema = %s AND table_name = %s
             )
         """)
-        params = (schema, table_name)
+        params: tuple[str, ...] = (schema, table_name)
     else:
         query = sql.SQL("""
             SELECT EXISTS (
@@ -96,10 +90,11 @@ def table_exists(conn, table: str) -> bool:
 
     with conn.cursor() as cur:
         cur.execute(query, params)
-        return cur.fetchone()[0]
+        result = cur.fetchone()
+        return bool(result[0]) if result else False
 
 
-def validate_tables_exist(conn, tables: list[str]) -> list[str]:
+def validate_tables_exist(conn: Any, tables: list[str]) -> list[str]:
     """Validate that all tables exist. Returns list of missing tables."""
     missing = []
     for table in tables:
@@ -129,7 +124,9 @@ def add_months(value: dt.datetime, months: int) -> dt.datetime:
     return dt.datetime(year, month, 1, tzinfo=dt.timezone.utc)
 
 
-def pg_get_min_created_at(conn, table: str, order_by: str = "created_at") -> Optional[dt.datetime]:
+def pg_get_min_created_at(
+    conn: Any, table: str, order_by: str = "created_at"
+) -> Optional[dt.datetime]:
     """Get the minimum value of the order_by column in the table."""
     query = sql.SQL("SELECT min({column}) FROM {table}").format(
         column=sql.Identifier(order_by), table=_table_identifier(table)
@@ -143,7 +140,7 @@ def pg_get_min_created_at(conn, table: str, order_by: str = "created_at") -> Opt
 
 
 def pg_count_rows(
-    conn, table: str, start: dt.datetime, end: dt.datetime, order_by: str = "created_at"
+    conn: Any, table: str, start: dt.datetime, end: dt.datetime, order_by: str = "created_at"
 ) -> int:
     """Count rows in the given time range."""
     query = sql.SQL("SELECT count(*) FROM {table} WHERE {column} >= %s AND {column} < %s").format(
@@ -154,7 +151,7 @@ def pg_count_rows(
         return int(cur.fetchone()[0])
 
 
-def pg_get_columns(conn, table: str) -> list[str]:
+def pg_get_columns(conn: Any, table: str) -> list[str]:
     """Get list of column names for a table."""
     query = sql.SQL("SELECT * FROM {table} LIMIT 0").format(table=_table_identifier(table))
     with conn.cursor() as cur:
@@ -163,7 +160,7 @@ def pg_get_columns(conn, table: str) -> list[str]:
 
 
 def list_chunks(
-    conn, table: str, cutoff_exclusive: dt.datetime, order_by: str = "created_at"
+    conn: Any, table: str, cutoff_exclusive: dt.datetime, order_by: str = "created_at"
 ) -> list[ChunkSpec]:
     """
     List monthly chunks of data to process up to the cutoff date.
@@ -191,16 +188,16 @@ def list_chunks(
 
 
 def export_chunk_to_parquet_streaming(
-    conn,
+    conn: Any,
     table: str,
     start: dt.datetime,
     end: dt.datetime,
-    parquet_path,
+    parquet_path: Path,
     order_by: str,
     fetch_size: int,
     row_group_size: int,
     compression: str,
-    encryption_properties,
+    encryption_properties: Any,
     masking: Optional[dict[str, str]] = None,
 ) -> int:
     """Stream rows to Parquet file. Returns row count."""
@@ -233,10 +230,10 @@ def export_chunk_to_parquet_streaming(
                 rows = cur.fetchmany(fetch_size)
                 if not rows:
                     break
-                
+
                 # Apply masking if configured
                 if masking:
-                     _apply_masking(rows, masking)
+                    _apply_masking(rows, masking)
 
                 if schema is None:
                     import pyarrow as pa
@@ -256,7 +253,9 @@ def export_chunk_to_parquet_streaming(
                     logger.debug(f"Initialized Parquet writer with {len(schema)} columns")
 
                 assert schema is not None and writer is not None
-                rb = pa.Table.from_pylist(rows, schema=schema).to_batches(max_chunksize=len(rows))[0]
+                rb = pa.Table.from_pylist(rows, schema=schema).to_batches(max_chunksize=len(rows))[
+                    0
+                ]
                 writer.write_batch(rb)
                 exported += len(rows)
                 batch_count += 1
@@ -287,7 +286,7 @@ def export_chunk_to_parquet_streaming(
 
 
 def delete_chunk_safely(
-    conn,
+    conn: Any,
     table: str,
     start: dt.datetime,
     end: dt.datetime,
@@ -316,7 +315,7 @@ def delete_chunk_safely(
         batch_num = 0
         while True:
             cur.execute(delete_query, (start, end, batch_size))
-            deleted = cur.rowcount
+            deleted = int(cur.rowcount)
             conn.commit()
             total += deleted
             batch_num += 1
@@ -332,41 +331,41 @@ def delete_chunk_safely(
 
 
 def delete_chunk_with_verification(
-    conn,
+    conn: Any,
     table: str,
     expected_sha256: str,
     s3_bucket: str,
     s3_key: str,
-    s3_client,
+    s3_client: Any,
     start: dt.datetime,
     end: dt.datetime,
     order_by: str,
-    config,  # BackparqConfig for batch_size
+    config: BackparqConfig,  # BackparqConfig for batch_size
 ) -> bool:
     """Delete chunk after verifying S3 backup exists and matches checksum."""
     from backparq.s3 import s3_verify_object_sha256
-    
+
     logger.info(f"Pre-delete verification for {table} [{start.strftime('%Y-%m')}]")
-    
+
     if not s3_verify_object_sha256(s3_client, s3_bucket, s3_key, expected_sha256):
         logger.error(f"S3 verification failed for {s3_key}. Data NOT deleted.")
         return False
-    
+
     db_row_count = pg_count_rows(conn, table, start, end, order_by)
     if db_row_count == 0:
         logger.info("No rows to delete")
         return True
-    
-    batch_size = getattr(config.archive, 'delete_batch_size', 10000)
+
+    batch_size = getattr(config.archive, "delete_batch_size", 10000)
     deleted = delete_chunk_safely(conn, table, start, end, batch_size, order_by)
-    
+
     if deleted != db_row_count:
         logger.warning(f"Deleted {deleted} rows but expected {db_row_count}")
-    
+
     return True
 
 
-def _serialize_for_postgres(value):
+def _serialize_for_postgres(value: Any) -> Any:
     """Serialize Python values for PostgreSQL COPY format."""
     import json
 
@@ -387,9 +386,9 @@ def _serialize_for_postgres(value):
 
 
 def insert_arrow_table_to_pg(
-    conn,
+    conn: Any,
     table: str,
-    arrow_table,
+    arrow_table: Any,
     conflict_mode: str = "do_nothing",
     primary_key: str = "id",
     batch_size: int = 10_000,
@@ -414,15 +413,16 @@ def insert_arrow_table_to_pg(
         return 0
 
     logger.info(f"Inserting {arrow_table.num_rows} rows into {table} (mode: {conflict_mode})")
-    
+
     # Check for complex types that pyarrow.csv might not handle compatibly with Postgres
     import pyarrow as pa
+
     has_complex_types = False
     for field in arrow_table.schema:
         if pa.types.is_nested(field.type) or pa.types.is_dictionary(field.type):
             has_complex_types = True
             break
-            
+
     if has_complex_types:
         logger.debug("Schema contains complex types; using slow serialization path")
     else:
@@ -435,14 +435,14 @@ def insert_arrow_table_to_pg(
 
     for batch in arrow_table.to_batches(max_chunksize=batch_size):
         if batch.num_rows == 0:
-             continue
+            continue
 
         buf = io.BytesIO()
-        
+
         if not has_complex_types:
             # FAST PATH: Use pyarrow.csv
             import pyarrow.csv as pacsv
-            
+
             # Configure pyarrow to write CSV compatible with Postgres COPY (FORMAT CSV)
             # - No header
             # - Tab delimiter (to match our COPY command)
@@ -450,29 +450,27 @@ def insert_arrow_table_to_pg(
             # - Escape '"' (default)
             # - Nulls as empty string (default)
             write_options = pacsv.WriteOptions(
-                include_header=False,
-                delimiter="\t",
-                quoting_style="needed"
+                include_header=False, delimiter="\t", quoting_style="needed"
             )
             pacsv.write_csv(batch, buf, write_options=write_options)
-            
+
             # pyarrow writes binary utf-8, perfect for BytesIO
-            
+
         else:
             # SLOW PATH: Manual serialization
             # We must use StringIO for csv module
             text_buf = io.StringIO()
             writer = csv.writer(text_buf, delimiter="\t", quoting=csv.QUOTE_MINIMAL, quotechar='"')
-            
+
             rows = batch.to_pylist()
             for row in rows:
                 csv_row = [_serialize_for_postgres(row[c]) for c in columns]
                 writer.writerow(csv_row)
-            
+
             # Encode to bytes for copy_expert
             text_buf.seek(0)
             buf.write(text_buf.getvalue().encode("utf-8"))
-            
+
         buf.seek(0)
 
         stage_table = f"stage_{int(time.time() * 1000000)}"
@@ -490,7 +488,7 @@ def insert_arrow_table_to_pg(
             copy_sql = sql.SQL(
                 "COPY {stage} ({cols}) FROM STDIN WITH (FORMAT CSV, DELIMITER E'\\t', QUOTE '\"', NULL '')"
             ).format(stage=stage_ident, cols=cols_str)
-            
+
             cur.copy_expert(copy_sql.as_string(conn), buf)
 
             # Build INSERT/UPSERT query
@@ -528,6 +526,7 @@ def insert_arrow_table_to_pg(
     logger.info(f"Insert complete: {total_inserted} rows affected")
     return total_inserted
 
+
 def vacuum_table(config: DatabaseConfig, table: str) -> None:
     """
     Run VACUUM ANALYZE on a table to reclaim storage.
@@ -535,7 +534,7 @@ def vacuum_table(config: DatabaseConfig, table: str) -> None:
     Must run outside of a transaction block (autocommit=True).
     """
     logger.info(f"Vacuuming table {table}...")
-    
+
     # Create a fresh connection specifically for VACUUM
     # We don't reuse the existing connection because we need autocommit=True
     # and we don't want to mess with the main connection's state.
@@ -552,17 +551,18 @@ def vacuum_table(config: DatabaseConfig, table: str) -> None:
     finally:
         conn.close()
 
+
 def _apply_masking(rows: list[dict], masking: dict[str, str]) -> None:
     """Apply masking rules to a batch of rows in-place."""
     import hashlib
-    
+
     for row in rows:
         for col, rule in masking.items():
             if col not in row or row[col] is None:
                 continue
-                
+
             val = str(row[col])
-            
+
             if rule == "hash":
                 # SHA256 hash
                 row[col] = hashlib.sha256(val.encode("utf-8")).hexdigest()

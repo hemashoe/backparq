@@ -5,11 +5,14 @@ from __future__ import annotations
 import json
 import logging
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 from rich.table import Table
 
 from backparq.config import BackparqConfig
+from backparq.db import connect_pg, pg_count_rows, pg_get_min_created_at, table_exists
+from backparq.storage.parquet import load_manifest
+from backparq.storage.s3 import create_client as s3_client_from_config
 from backparq.utils.console import (
     console,
     format_count,
@@ -18,9 +21,6 @@ from backparq.utils.console import (
     print_success,
     print_warning,
 )
-from backparq.db import connect_pg, pg_count_rows, pg_get_min_created_at, table_exists
-from backparq.storage.parquet import load_manifest
-from backparq.storage.s3 import create_client as s3_client_from_config
 
 logger = logging.getLogger(__name__)
 
@@ -28,7 +28,7 @@ logger = logging.getLogger(__name__)
 def show_status(
     config: BackparqConfig, table_filter: Optional[str] = None, output_json: bool = False
 ) -> dict:
-    result = {"tables": [], "summary": {}}
+    result: dict[str, Any] = {"tables": [], "summary": {}}
 
     if not output_json:
         print_header("BACKPARQ STATUS")
@@ -65,7 +65,7 @@ def show_status(
     try:
         for table_config in tables:
             table = table_config.name
-            table_data = {"name": table, "primary_key": table_config.primary_key}
+            table_data: dict[str, Any] = {"name": table, "primary_key": table_config.primary_key}
 
             if not table_exists(conn, table):
                 table_data["status"] = "not_found"
@@ -136,7 +136,7 @@ def show_status(
     return result
 
 
-def _get_db_stats(conn, table: str, order_by: str, cutoff) -> dict:
+def _get_db_stats(conn: Any, table: str, order_by: str, cutoff: Any) -> dict:
     import datetime as dt
 
     min_date = pg_get_min_created_at(conn, table, order_by)
@@ -158,7 +158,7 @@ def _get_local_stats(base_dir: Path, table: str) -> dict:
     safe_table = table.replace(".", "_")
     parquet_dir = base_dir / "parquet" / safe_table
 
-    stats = {
+    stats: dict[str, Any] = {
         "chunk_count": 0,
         "total_size": 0,
         "total_rows": 0,
@@ -199,7 +199,7 @@ def _get_local_stats(base_dir: Path, table: str) -> dict:
     return stats
 
 
-def _get_s3_stats(s3, bucket: str, prefix: str, table: str, mode: str) -> dict:
+def _get_s3_stats(s3: Any, bucket: str, prefix: str, table: str, mode: str) -> dict:
     safe_table = table.replace(".", "_")
     s3_prefix = f"{prefix}/backups/" if mode == "backup" else f"{prefix}/archive/{safe_table}/"
 

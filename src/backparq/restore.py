@@ -13,7 +13,6 @@ from typing import Optional
 
 from backparq.archive import chunk_paths, s3_key_for_chunk
 from backparq.config import BackparqConfig
-from backparq.utils.console import console
 from backparq.db import (
     ChunkSpec,
     add_months,
@@ -23,8 +22,9 @@ from backparq.db import (
     pg_get_columns,
 )
 from backparq.storage.parquet import read_parquet as read_chunk
-from backparq.storage.s3 import create_client as s3_client_from_config, verify_connection as test_s3_connection
-
+from backparq.storage.s3 import create_client as s3_client_from_config
+from backparq.storage.s3 import verify_connection as test_s3_connection
+from backparq.utils.console import console
 from backparq.utils.logging import log_with_data
 
 logger = logging.getLogger(__name__)
@@ -49,9 +49,16 @@ def restore_tables(
         conflict_mode: "do_nothing" (skip existing) or "upsert" (override)
         backup_id: If restoring from backup mode, specify the run ID
     """
-    log_with_data(logger, logging.INFO, "Starting restore", 
-                  start=str(start_date.date()), end=str(end_date.date()), 
-                  mode=conflict_mode, dry_run=dry_run, backup_id=backup_id)
+    log_with_data(
+        logger,
+        logging.INFO,
+        "Starting restore",
+        start=str(start_date.date()),
+        end=str(end_date.date()),
+        mode=conflict_mode,
+        dry_run=dry_run,
+        backup_id=backup_id,
+    )
 
     conn = connect_pg(config.database)
     s3 = None
@@ -75,7 +82,7 @@ def restore_tables(
 
             # Get current DB schema
             db_columns = set(pg_get_columns(conn, table))
-            
+
             # Iterate through monthly chunks
             curr = month_floor(start_date)
             cutoff = end_date
@@ -90,68 +97,98 @@ def restore_tables(
                     config.archive.base_dir, chunk_spec
                 )
 
-                # Determine if we need to download from S3
-                need_download = False
-                if backup_id:
-                    need_download = True
-                elif not final_parquet.exists():
-                    need_download = True
-
                 # Download from S3 if needed
-                if need_download:
+                files_to_restore = []
+
+                if backup_id:
+                    # Backup mode: list files from the backup directory
+                    year = curr.year
+                    month = curr.month
+                    safe_table = table.replace(".", "_")
+                    # Backups use a stricter structure with run_id prefix
+                    s3_prefix_dir = (
+                        f"{config.s3.prefix}/backups/{backup_id}/"
+                        f"{safe_table}/year={year:04d}/month={month:02d}/"
+                    )
+                    need_download = True
+                else:
+                    # Offload mode: Directory might contain multiple files (incremental runs)
+                    year = curr.year
+                    month = curr.month
+                    safe_table = table.replace(".", "_")
+                    s3_prefix_dir = f"{config.s3.prefix}/archive/{safe_table}/year={year:04d}/month={month:02d}/"
+                    # Check local first? If purely local restore?
+                    # But we want to sync from S3.
+                    # If we don't have S3 config, we rely on local files.
                     if s3:
-                        if backup_id:
-                            year = curr.year
-                            month = curr.month
-                            safe_table = table.replace(".", "_")
-                            name = f"{safe_table}_{year:04d}-{month:02d}.parquet"
-                            s3_key = (
-                                f"{config.s3.prefix}/backups/{backup_id}/"
-                                f"{safe_table}/year={year:04d}/month={month:02d}/{name}"
-                            )
-                        else:
-                            s3_key = s3_key_for_chunk(config.s3.prefix, chunk_spec, mode="offload")
-
-                        if not dry_run:
-                            try:
-                                final_parquet.parent.mkdir(parents=True, exist_ok=True)
-                                s3.download_file(config.s3.bucket, s3_key, final_parquet.as_posix())
-
-                                # Verify checksum
-                                try:
-                                    head = s3.head_object(Bucket=config.s3.bucket, Key=s3_key)
-                                    expected_sha = head.get("Metadata", {}).get("sha256", "")
-                                    if expected_sha:
-                                        from backparq.parquet import sha256_file
-                                        actual_sha = sha256_file(final_parquet)
-                                        if actual_sha != expected_sha:
-                                            logger.error(f"Checksum mismatch for {s3_key}")
-                                            final_parquet.unlink(missing_ok=True)
-                                            curr = next_month
-                                            continue
-                                except Exception:
-                                    pass
-
-                                log_with_data(logger, logging.DEBUG, "Downloaded chunk", key=s3_key)
-                            except Exception:
-                                # Siltently skip missing chunks in S3 (expected for empty months)
-                                curr = next_month
-                                continue
-                        else:
-                            logger.info(f"DRY RUN: would download {s3_key}")
+                        need_download = True
                     else:
-                        if not final_parquet.exists():
+                        # Local only: find files in directory
+                        chunk_dir = (
+                            config.archive.base_dir
+                            / "parquet"
+                            / safe_table
+                            / f"year={year:04d}"
+                            / f"month={month:02d}"
+                        )
+                        if chunk_dir.exists():
+                            files_to_restore = list(chunk_dir.glob("*.parquet"))
+                        need_download = False
+
+                if need_download and s3:
+                    if not dry_run:
+                        try:
+                            # List objects in the directory
+                            response = s3.list_objects_v2(
+                                Bucket=config.s3.bucket, Prefix=s3_prefix_dir
+                            )
+                            if "Contents" in response:
+                                for obj in response["Contents"]:
+                                    key = obj["Key"]
+                                    if not key.endswith(".parquet"):
+                                        continue
+
+                                    filename = key.split("/")[-1]
+                                    chunk_dir = (
+                                        config.archive.base_dir
+                                        / "parquet"
+                                        / safe_table
+                                        / f"year={year:04d}"
+                                        / f"month={month:02d}"
+                                    )
+                                    chunk_dir.mkdir(parents=True, exist_ok=True)
+
+                                    local_file = chunk_dir / filename
+                                    files_to_restore.append(local_file)
+
+                                    # Download if not exists or verify?
+                                    # For restore, we usually download.
+                                    s3.download_file(config.s3.bucket, key, local_file.as_posix())
+                                    log_with_data(
+                                        logger, logging.DEBUG, "Downloaded chunk", key=key
+                                    )
+                            else:
+                                # No files in S3 for this month
+                                pass
+                        except Exception as e:
+                            logger.error(
+                                f"Failed to list/download S3 objects for {s3_prefix_dir}: {e}"
+                            )
                             curr = next_month
                             continue
-
-                # Restore data from parquet file
-                if dry_run:
-                    logger.info(f"DRY RUN: would restore {final_parquet}")
-                else:
-                    if not final_parquet.exists():
-                        curr = next_month
+                    else:
+                        logger.info(f"DRY RUN: would list and restore files from {s3_prefix_dir}")
+                        curr = next_month  # Skip rest of loop for dry run
                         continue
 
+                # If we are in local-only mode (need_download=False), files_to_restore is already set
+
+                if not files_to_restore:
+                    # No files found (S3 or Local)
+                    curr = next_month
+                    continue
+
+                for final_parquet in files_to_restore:
                     try:
                         table_arrow = read_chunk(final_parquet)
                         parquet_cols = set(table_arrow.column_names)
@@ -171,9 +208,15 @@ def restore_tables(
                             conflict_mode=conflict_mode,
                             primary_key=primary_key,
                         )
-                        
-                        log_with_data(logger, logging.INFO, "Restored chunk", 
-                                      table=table, month=curr.strftime("%Y-%m"), rows=inserted)
+
+                        log_with_data(
+                            logger,
+                            logging.INFO,
+                            "Restored chunk",
+                            table=table,
+                            month=curr.strftime("%Y-%m"),
+                            rows=inserted,
+                        )
 
                     except Exception as e:
                         logger.error(f"Failed to restore chunk {chunk_spec}: {e}")

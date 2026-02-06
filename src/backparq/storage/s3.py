@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import logging
+from pathlib import Path
+from typing import Any, Optional
 
 import boto3
 import botocore
@@ -13,17 +15,27 @@ from backparq.config import S3Config
 
 logger = logging.getLogger(__name__)
 
+# Default timeouts in seconds
+DEFAULT_CONNECT_TIMEOUT = 30
+DEFAULT_READ_TIMEOUT = 60
 
-def create_client(config: S3Config):
-    """Create S3 client from configuration."""
-    s3_config = None
+
+def create_client(config: S3Config) -> Any:
+    """Create S3 client from configuration with proper timeouts."""
+    s3_config_kwargs = {
+        "max_pool_connections": 50,
+        "connect_timeout": DEFAULT_CONNECT_TIMEOUT,
+        "read_timeout": DEFAULT_READ_TIMEOUT,
+        "retries": {
+            "max_attempts": 3,
+            "mode": "adaptive",
+        },
+    }
+
     if config.addressing_style:
-        s3_config = Config(
-            s3={"addressing_style": config.addressing_style},
-            max_pool_connections=50,
-        )
-    else:
-        s3_config = Config(max_pool_connections=50)
+        s3_config_kwargs["s3"] = {"addressing_style": config.addressing_style}
+
+    s3_config = Config(**s3_config_kwargs)
 
     session = boto3.session.Session(
         aws_access_key_id=config.access_key_id,
@@ -41,9 +53,6 @@ def create_client(config: S3Config):
     )
 
 
-
-
-
 def verify_connection(config: S3Config) -> None:
     """Test S3 bucket connectivity."""
     s3 = create_client(config)
@@ -57,13 +66,13 @@ def verify_connection(config: S3Config) -> None:
 
 @retry(stop=stop_after_attempt(5), wait=wait_exponential(multiplier=1, min=2, max=60))
 def upload_file(
-    s3,
-    path,
+    s3: Any,
+    path: Path,
     bucket: str,
     key: str,
     sha256: str,
-    extra_args: dict = None,
-    metadata: dict = None,
+    extra_args: Optional[dict[str, Any]] = None,
+    metadata: Optional[dict[str, Any]] = None,
 ) -> None:
     """Upload file to S3 with SHA256 and custom metadata."""
     meta = {"sha256": sha256}
@@ -78,7 +87,7 @@ def upload_file(
     logger.debug(f"Uploaded {key}")
 
 
-def verify_checksum(s3, bucket: str, key: str, expected: str) -> bool:
+def verify_checksum(s3: Any, bucket: str, key: str, expected: str) -> bool:
     """Check if S3 object exists with matching SHA256."""
     try:
         head = s3.head_object(Bucket=bucket, Key=key)
@@ -91,12 +100,13 @@ def verify_checksum(s3, bucket: str, key: str, expected: str) -> bool:
         return False
 
 
-def download_file(s3, bucket: str, key: str, path: str) -> None:
-    """Download file from S3."""
+@retry(stop=stop_after_attempt(5), wait=wait_exponential(multiplier=1, min=2, max=60))
+def download_file(s3: Any, bucket: str, key: str, path: str) -> None:
+    """Download file from S3 with retry on transient failures."""
     s3.download_file(bucket, key, path)
 
 
-def list_objects(s3, bucket: str, prefix: str) -> list:
+def list_objects(s3: Any, bucket: str, prefix: str) -> list[Any]:
     """List objects under prefix."""
     paginator = s3.get_paginator("list_objects_v2")
     objects = []
