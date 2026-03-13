@@ -88,16 +88,27 @@ def upload_file(
 
 
 def verify_checksum(s3: Any, bucket: str, key: str, expected: str) -> bool:
-    """Check if S3 object exists with matching SHA256."""
+    """
+    Check if S3 object exists with matching SHA256.
+
+    Returns False for 404 (object missing).
+    Re-raises for all other errors (auth failure, network, etc.) so callers
+    cannot silently mistake a transient error for a checksum mismatch.
+    """
     try:
         head = s3.head_object(Bucket=bucket, Key=key)
         actual = head.get("Metadata", {}).get("sha256", "")
         if actual == expected:
             return True
-        logger.warning(f"Checksum mismatch for {key}")
+        logger.warning(f"Checksum mismatch for {key}: expected {expected!r}, got {actual!r}")
         return False
-    except botocore.exceptions.ClientError:
-        return False
+    except botocore.exceptions.ClientError as exc:
+        code = exc.response.get("Error", {}).get("Code", "")
+        if code in ("404", "NoSuchKey"):
+            logger.warning(f"S3 object not found: {key}")
+            return False
+        # Unexpected error (403 Forbidden, network, etc.) — propagate it.
+        raise
 
 
 @retry(stop=stop_after_attempt(5), wait=wait_exponential(multiplier=1, min=2, max=60))

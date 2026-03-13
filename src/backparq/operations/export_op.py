@@ -1,8 +1,8 @@
-"""Export operation: IN_DB → EXPORTED (SNAPSHOT + WATERMARK).
+"""Export operation: IN_DB → EXPORTED (WATERMARK-BASED).
 
-Uses PostgreSQL 'REPEATABLE READ' isolation with specific snapshot ID
-to ensure consistent view across all chunks.
-Uses 'watermark_id' (MAX(id)) to define a safe cutoff point for deletion.
+Uses 'watermark_id' (MAX(id) at the start of the run) to define a safe cutoff
+for deletion.  DuckDB opens its own READ COMMITTED connection to PostgreSQL,
+so the watermark — not snapshot isolation — is the primary safety mechanism.
 """
 
 from __future__ import annotations
@@ -19,6 +19,7 @@ if TYPE_CHECKING:
 
 from backparq.adapters.catalog import ChunkState
 from backparq.db.operations import export_chunk_to_parquet_streaming
+from backparq.primitives import chunk_id as make_chunk_id
 from backparq.primitives import chunk_paths, compute_sha256
 
 logger = logging.getLogger(__name__)
@@ -52,7 +53,7 @@ def export_chunk(
     Returns:
         Dict with stats: rows_exported, bytes_written, sha256
     """
-    chunk_id = f"{chunk.table}_{chunk.start.strftime('%Y%m%d%H%M%S')}"
+    chunk_id = make_chunk_id(chunk)
 
     # Check state
     current_state = catalog.get_state(chunk_id)
@@ -100,12 +101,7 @@ def export_chunk(
         )
 
         if rows_exported == 0:
-            logger.warning(f"No rows exported for {chunk_id}")
-            # We still mark it as exported so we don't loop forever?
-            # Or maybe we skip creating files?
-            # If 0 rows, we might still want to record it so we can "delete" 0 rows later?
-            # Creating empty parquet is fine.
-            pass
+            logger.warning(f"No rows exported for {chunk_id}; recording state to prevent re-processing.")
 
         # Rename to final path
         inprogress_path.rename(final_path)

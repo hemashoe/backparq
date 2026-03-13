@@ -5,17 +5,34 @@ from __future__ import annotations
 import datetime as dt
 import uuid
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 if TYPE_CHECKING:
     from backparq.db.operations import ChunkSpec
 
 
-def normalize_dt(value: dt.datetime) -> dt.datetime:
-    """Normalize a datetime to UTC timezone-aware."""
+def normalize_dt(value: Optional[dt.datetime]) -> Optional[dt.datetime]:
+    """Normalize a datetime to UTC timezone-aware. Returns None if value is None."""
+    if value is None:
+        return None
     if value.tzinfo is None:
         value = value.replace(tzinfo=dt.timezone.utc)
     return value.astimezone(dt.timezone.utc)
+
+
+def parse_iso_datetime(value: str) -> dt.datetime:
+    """
+    Parse an ISO 8601 datetime string to a UTC-aware datetime.
+
+    Handles both '+00:00' and 'Z' suffixes — Python < 3.11 does not support 'Z'
+    in fromisoformat(), so we normalise it before parsing.
+    """
+    if value.endswith("Z"):
+        value = value[:-1] + "+00:00"
+    parsed = dt.datetime.fromisoformat(value)
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=dt.timezone.utc)
+    return parsed.astimezone(dt.timezone.utc)
 
 
 def month_floor(value: dt.datetime) -> dt.datetime:
@@ -74,6 +91,16 @@ def chunk_paths(base_dir: Path, chunk: ChunkSpec) -> tuple[Path, Path, Path, Pat
     manifest = chunk_dir / f"{name}.manifest.json"
 
     return final, inprogress, sha_path, manifest
+
+
+def chunk_id(chunk: ChunkSpec) -> str:
+    """
+    Generate a stable, unique identifier for a chunk.
+
+    Single source of truth — import this everywhere instead of repeating the
+    f-string pattern across export_op, upload_op, delete_op, restore_op.
+    """
+    return f"{chunk.table}_{chunk.start.strftime('%Y%m%d%H%M%S')}"
 
 
 def s3_key_for_chunk(

@@ -16,6 +16,7 @@ if TYPE_CHECKING:
 
 from backparq.adapters.catalog import ChunkState
 from backparq.db.operations import delete_chunk_with_verification
+from backparq.primitives import chunk_id as make_chunk_id
 
 logger = logging.getLogger(__name__)
 
@@ -26,7 +27,6 @@ def delete_chunk(
     catalog: Catalog,
     s3_client: Any,
     config: BackparqConfig,
-    vacuum: bool = False,
     batch_size: int = 10_000,
 ) -> dict[str, Any]:
     """
@@ -38,27 +38,26 @@ def delete_chunk(
         catalog: Catalog for state tracking
         s3_client: S3 client
         config: Full configuration
-        vacuum: Whether to run VACUUM after delete
         batch_size: Rows to delete per batch
 
     Returns:
-        Dict with stats: rows_deleted, vacuumed, skipped
+        Dict with stats: rows_deleted, skipped
     """
-    chunk_id = f"{chunk.table}_{chunk.start.strftime('%Y%m%d%H%M%S')}"
+    chunk_id = make_chunk_id(chunk)
 
     # Check state
     current_state = catalog.get_state(chunk_id)
     if not current_state:
         logger.warning(f"Chunk {chunk_id} not found in catalog")
-        return {"rows_deleted": 0, "vacuumed": False, "skipped": True}
+        return {"rows_deleted": 0, "skipped": True}
 
     if current_state < ChunkState.UPLOADED:
         logger.warning(f"Chunk {chunk_id} not uploaded yet (state: {current_state})")
-        return {"rows_deleted": 0, "vacuumed": False, "skipped": True}
+        return {"rows_deleted": 0, "skipped": True}
 
     if current_state >= ChunkState.OFFLOADED:
         logger.debug(f"Chunk {chunk_id} already offloaded, skipping")
-        return {"rows_deleted": 0, "vacuumed": False, "skipped": True}
+        return {"rows_deleted": 0, "skipped": True}
 
     # Get chunk data
     chunk_data = catalog.get_chunk(chunk_id)
@@ -98,20 +97,9 @@ def delete_chunk(
 
     if deleted < 0:
         logger.error(f"Deletion failed verification for {chunk_id}")
-        return {"rows_deleted": 0, "vacuumed": False, "skipped": True}
-
-    # Run VACUUM if requested
-    vacuumed = False
-    if vacuum:
-        # VACUUM cannot run within a transaction block.
-        # Skip here and let pipeline handle it or run separately.
-        logger.debug("Skipping VACUUM inside transaction block")
+        return {"rows_deleted": 0, "skipped": True}
 
     # Update Catalog
     catalog.transition(chunk_id, ChunkState.OFFLOADED)
 
-    return {
-        "rows_deleted": deleted,
-        "vacuumed": vacuumed,
-        "skipped": False,
-    }
+    return {"rows_deleted": deleted, "skipped": False}

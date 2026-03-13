@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import datetime as dt
+import hashlib
+import json
 import logging
 import threading
 import time
@@ -10,10 +12,13 @@ from typing import Any
 
 from backparq.adapters.catalog import Catalog, ChunkState, RunStatus
 from backparq.config import BackparqConfig, S3Config
-from backparq.db import ConnectionPool, list_chunks
-from backparq.db.operations import pg_get_max_id
+from backparq.db import ConnectionPool, list_chunks, validate_tables_exist
+from backparq.db.operations import ChunkSpec, pg_get_max_id
 from backparq.models import ArchiveResult, RestoreResult, VerifyResult
 from backparq.operations import delete_chunk, export_chunk, upload_chunk
+from backparq.operations.restore_op import restore_chunk
+from backparq.operations.verify_op import verify_chunk
+from backparq.primitives import parse_iso_datetime
 from backparq.storage.s3 import create_client as s3_client_from_config
 from backparq.utils.console import console, create_progress, print_header, print_success
 from backparq.utils.lock import AdvisoryLock
@@ -40,12 +45,15 @@ def archive_tables(
     """
     Archive tables according to configuration.
 
-    This implements Backparq 2.0 Architecture:
-    1. Coordinator acquires Advisory Lock.
-    2. Coordinator starts Global Snapshot Transaction (pg_export_snapshot).
-    3. Coordinator calculates Watermarks (MAX(id)) for data safety.
-    4. Workers share the Snapshot ID to ensure consistent views.
-    5. Workers use Watermark ID to ensure safe deletion (only delete what was seen).
+    Safety model:
+    1. Coordinator acquires Advisory Lock (single-process enforcement).
+    2. Coordinator calculates Watermarks (MAX(id) before cutoff) for each table.
+    3. Workers export data up to the watermark boundary.
+    4. Workers delete only rows covered by the watermark (safe from new writes).
+
+    Note: DuckDB opens its own READ COMMITTED connection to PostgreSQL.
+    Snapshot isolation is NOT enforced across workers. The watermark is the
+    primary safety mechanism for deletion correctness.
 
     Args:
         config: Backparq configuration
@@ -59,19 +67,23 @@ def archive_tables(
     start_time = time.time()
     shutdown = shutdown_event or threading.Event()
 
-    print_header("BACKPARQ ARCHIVE (Snapshot Consistency)")
+    print_header("BACKPARQ ARCHIVE")
     console.print(f"Mode: [bold]{config.archive.mode}[/bold]")
     console.print(f"Tables: {', '.join(t.name for t in config.archive.tables)}")
     console.print(f"Cutoff: {config.archive.cutoff_exclusive}")
     console.print(f"Dry Run: {'yes' if config.archive.dry_run else 'no'}")
     console.print()
 
+    # Compute cutoff once — all tables use the same point in time
+    cutoff = config.archive.cutoff_exclusive or dt.datetime.now(dt.timezone.utc)
+    if cutoff.tzinfo is None:
+        cutoff = cutoff.replace(tzinfo=dt.timezone.utc)
+
     # Calculate required connections: (tables * chunks) + buffer + Coordinator
     total_concurrency = config.archive.concurrency * config.archive.chunk_concurrency
     pool = ConnectionPool(config.database, minconn=2, maxconn=total_concurrency + 3)
 
     # Coordinator Connection & Lock
-    # We must hold this connection open throughout the ENTIRE process to keep the snapshot alive.
     try:
         with pool.connection() as coord_conn:
             # 1. Acquire Distributed Lock
@@ -82,125 +94,98 @@ def archive_tables(
                 return result
 
             try:
-                # 2. Start Global Snapshot Transaction
-                # We need REPEATABLE READ or SERIALIZABLE for pg_export_snapshot
-                coord_conn.rollback()  # Ensure clean state
-                # Set isolation level to REPEATABLE READ (3 in psycopg/libpq usually, but use SQL to be safe)
-                with coord_conn.transaction():
-                    coord_conn.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+                # 2. Validate tables exist — raise if any are missing
+                missing = validate_tables_exist(
+                    coord_conn, [t.name for t in config.archive.tables]
+                )
+                if missing:
+                    raise RuntimeError(f"Tables not found in database: {', '.join(missing)}")
 
-                    # export snapshot
-                    cur = coord_conn.execute("SELECT pg_export_snapshot()")
-                    snapshot_id = cur.fetchone()[0]
-                    logger.info(f"Started Global Snapshot: {snapshot_id}")
+                # 3. Calculate Watermarks (MAX(id) at cutoff time per table)
+                watermarks: dict[str, Any] = {}
+                for t in config.archive.tables:
+                    wm_id = pg_get_max_id(
+                        coord_conn,
+                        t.name,
+                        primary_key=t.primary_key,
+                        cutoff=cutoff,
+                        order_by=t.order_by,
+                    )
+                    watermarks[t.name] = wm_id
+                    logger.info(f"Watermark for {t.name}: {wm_id}")
 
-                    # 3. Calculate Watermarks (on the coordinator connection, inside the snapshot)
-                    watermarks = {}
-                    for t in config.archive.tables:
-                        # Normalize cutoff
-                        cutoff = config.archive.cutoff_exclusive or dt.datetime.now(dt.timezone.utc)
-                        # Ensure cutoff is timezone aware
-                        if cutoff.tzinfo is None:
-                            cutoff = cutoff.replace(tzinfo=dt.timezone.utc)
+                # Initialize adapters
+                catalog_path = config.archive.base_dir / "backparq.db"
+                catalog = Catalog(catalog_path)
+                s3 = s3_client_from_config(config.s3) if config.s3.bucket else None
 
-                        wm_id = pg_get_max_id(
-                            coord_conn,
-                            t.name,
-                            primary_key=t.primary_key if hasattr(t, "primary_key") else "id",
-                            cutoff=cutoff,
-                            order_by=t.order_by,
+                # Start run tracking
+                config_hash = hashlib.sha256(
+                    json.dumps(config.__dict__, default=str, sort_keys=True).encode()
+                ).hexdigest()[:16]
+                run_id = catalog.start_run(config.archive.mode, config_hash)
+
+                # Notify
+                if config.notifications:
+                    send_notification(
+                        config.notifications,
+                        "archive_started",
+                        {"run_id": run_id, "mode": config.archive.mode},
+                    )
+
+                # 4. Process Tables
+                with create_progress() as progress:
+                    if config.archive.concurrency > 1:
+                        logger.info(
+                            f"Processing {len(config.archive.tables)} tables with concurrency {config.archive.concurrency}"
                         )
-                        watermarks[t.name] = wm_id
-                        logger.info(f"Watermark for {t.name}: {wm_id}")
-
-                    # Initialize adapters
-                    catalog_path = config.archive.base_dir / "backparq.db"
-                    catalog = Catalog(catalog_path)
-                    s3 = s3_client_from_config(config.s3) if config.s3.bucket else None
-
-                    # Start run tracking
-                    import hashlib
-                    import json
-
-                    config_hash = hashlib.sha256(
-                        json.dumps(config.__dict__, default=str, sort_keys=True).encode()
-                    ).hexdigest()[:16]
-                    run_id = catalog.start_run(config.archive.mode, config_hash)
-
-                    # Notify
-                    if config.notifications:
-                        send_notification(
-                            config.notifications,
-                            "archive_started",
-                            {
-                                "run_id": run_id,
-                                "mode": config.archive.mode,
-                                "snapshot": snapshot_id,
-                            },
-                        )
-
-                    # Validate tables exist (pass coord_conn inside transaction is safe as it's read-only checks or we trust it)
-                    # Actually validate_tables_exist relies on simple SELECTs.
-                    # We can use the coordinator connection.
-                    from backparq.db import validate_tables_exist
-
-                    validate_tables_exist(coord_conn, [t.name for t in config.archive.tables])
-
-                    # 4. Process Tables (Delegation)
-                    # We pass snapshot_id and individual watermarks
-                    with create_progress() as progress:
-                        if config.archive.concurrency > 1:
-                            logger.info(
-                                f"Processing {len(config.archive.tables)} tables with concurrency {config.archive.concurrency}"
-                            )
-                            with ThreadPoolExecutor(
-                                max_workers=config.archive.concurrency
-                            ) as executor:
-                                futures = {
-                                    executor.submit(
-                                        _process_table,
-                                        table_config=table_config,
-                                        config=config,
-                                        catalog=catalog,
-                                        pool=pool,
-                                        s3=s3,
-                                        run_id=run_id,
-                                        progress=progress,
-                                        result=result,
-                                        shutdown=shutdown,
-                                        snapshot_id=snapshot_id,
-                                        watermark_id=watermarks.get(table_config.name),
-                                    ): table_config.name
-                                    for table_config in config.archive.tables
-                                }
-                                for future in as_completed(futures):
-                                    if shutdown.is_set():
-                                        executor.shutdown(wait=False, cancel_futures=True)
-                                        break
-                                    try:
-                                        future.result()
-                                    except Exception as e:
-                                        logger.error(f"Table processing failed: {e}")
-                        else:
-                            for table_config in config.archive.tables:
-                                if shutdown.is_set():
-                                    break
-                                _process_table(
+                        with ThreadPoolExecutor(
+                            max_workers=config.archive.concurrency
+                        ) as executor:
+                            futures = {
+                                executor.submit(
+                                    _process_table,
                                     table_config=table_config,
                                     config=config,
                                     catalog=catalog,
                                     pool=pool,
                                     s3=s3,
                                     run_id=run_id,
+                                    cutoff=cutoff,
                                     progress=progress,
                                     result=result,
                                     shutdown=shutdown,
-                                    snapshot_id=snapshot_id,
                                     watermark_id=watermarks.get(table_config.name),
-                                )
+                                ): table_config.name
+                                for table_config in config.archive.tables
+                            }
+                            for future in as_completed(futures):
+                                if shutdown.is_set():
+                                    executor.shutdown(wait=False, cancel_futures=True)
+                                    break
+                                try:
+                                    future.result()
+                                except Exception as e:
+                                    logger.error(f"Table processing failed: {e}")
+                    else:
+                        for table_config in config.archive.tables:
+                            if shutdown.is_set():
+                                break
+                            _process_table(
+                                table_config=table_config,
+                                config=config,
+                                catalog=catalog,
+                                pool=pool,
+                                s3=s3,
+                                run_id=run_id,
+                                cutoff=cutoff,
+                                progress=progress,
+                                result=result,
+                                shutdown=shutdown,
+                                watermark_id=watermarks.get(table_config.name),
+                            )
 
             finally:
-                # Release lock explicitly
                 try:
                     lock.release()
                 except Exception as e:
@@ -209,7 +194,6 @@ def archive_tables(
     except Exception as e:
         logger.error(f"Archive process failed: {e}")
         result.errors.append(str(e))
-        # Ensure we close pool
         pool.close()
         return result
 
@@ -238,8 +222,6 @@ def archive_tables(
         console.print()
         console.print(f"[bold]Total rows exported:[/bold] {result.total_rows_exported:,}")
         if config.archive.mode == "offload":
-            # Note: logic for showing deleted rows only if offload is same as before
-            # But here just simplify:
             console.print(f"[bold]Total rows deleted:[/bold] {result.total_rows_deleted:,}")
         console.print(f"[bold]Elapsed:[/bold] {elapsed:.1f}s")
 
@@ -257,22 +239,21 @@ def _process_table(
     pool: ConnectionPool,
     s3: Any,
     run_id: str,
+    cutoff: dt.datetime,
     progress: Any,
     result: ArchiveResult,
     shutdown: threading.Event,
-    snapshot_id: str,
     watermark_id: Any,
 ) -> None:
     """Process a single table."""
     table = table_config.name
 
-    # Get chunks to process using shared snapshot
-    with pool.connection(snapshot_id=snapshot_id) as conn:
+    with pool.connection() as conn:
         chunks = list_chunks(
             conn,
             table,
-            config.archive.cutoff_exclusive,
-            order_by=config.archive.order_by,
+            cutoff,
+            order_by=table_config.order_by,
             target_rows=config.archive.chunk_rows,
         )
 
@@ -282,7 +263,6 @@ def _process_table(
 
     logger.info(f"Processing {table}: {len(chunks)} chunks")
 
-    # Create progress task
     task = progress.add_task(f"[cyan]{table}", total=len(chunks))
 
     process_args = {
@@ -297,15 +277,16 @@ def _process_table(
         "task": task,
         "result": result,
         "shutdown": shutdown,
-        "snapshot_id": snapshot_id,
         "watermark_id": watermark_id,
     }
 
-    # Process chunks with concurrency
     if config.archive.chunk_concurrency > 1:
         _process_chunks_parallel(**process_args)
     else:
         _process_chunks_sequential(**process_args)
+
+    with result._lock:
+        result.tables_processed += 1
 
 
 def _process_chunks_sequential(
@@ -320,7 +301,6 @@ def _process_chunks_sequential(
     task: Any,
     result: ArchiveResult,
     shutdown: threading.Event,
-    snapshot_id: str,
     watermark_id: Any,
 ) -> None:
     """Process chunks sequentially."""
@@ -338,7 +318,6 @@ def _process_chunks_sequential(
                 s3=s3,
                 run_id=run_id,
                 result=result,
-                snapshot_id=snapshot_id,
                 watermark_id=watermark_id,
             )
         except Exception as e:
@@ -360,7 +339,6 @@ def _process_chunks_parallel(
     task: Any,
     result: ArchiveResult,
     shutdown: threading.Event,
-    snapshot_id: str,
     watermark_id: Any,
 ) -> None:
     """Process chunks in parallel."""
@@ -376,7 +354,6 @@ def _process_chunks_parallel(
                 s3=s3,
                 run_id=run_id,
                 result=result,
-                snapshot_id=snapshot_id,
                 watermark_id=watermark_id,
             ): chunk
             for chunk in chunks
@@ -406,7 +383,6 @@ def _process_chunk(
     s3: Any,
     run_id: str,
     result: ArchiveResult,
-    snapshot_id: str,
     watermark_id: Any,
 ) -> None:
     """
@@ -422,7 +398,7 @@ def _process_chunk(
         return
 
     # Stage 1: Export
-    with pool.connection(snapshot_id=snapshot_id) as conn:
+    with pool.connection() as conn:
         export_stats = export_chunk(
             chunk=chunk,
             conn=conn,
@@ -430,12 +406,10 @@ def _process_chunk(
             base_dir=config.archive.base_dir,
             parquet_config=config.parquet,
             table_config=table_config,
-            snapshot_id=snapshot_id,
             watermark_id=watermark_id,
             db_config=config.database,
         )
 
-    # Thread-safe result mutation
     with result._lock:
         result.total_rows_exported += export_stats.get("rows_exported", 0)
 
@@ -467,7 +441,6 @@ def _process_chunk(
                 catalog=catalog,
                 s3_client=s3,
                 config=config,
-                vacuum=config.archive.vacuum,
                 batch_size=config.archive.delete_batch_size,
             )
 
@@ -488,10 +461,6 @@ def restore_tables(
 
     Orchestrates the restore pipeline: download → restore.
     """
-    from backparq.models import RestoreResult
-    from backparq.operations.restore_op import restore_chunk
-    from backparq.storage.s3 import create_client as s3_client_from_config
-
     result = RestoreResult()
     start_time = time.time()
 
@@ -502,15 +471,13 @@ def restore_tables(
     console.print(f"Dry Run: {'yes' if dry_run else 'no'}")
     console.print()
 
+    pool = ConnectionPool(config.database, minconn=2, maxconn=config.archive.concurrency + 2)
+
     try:
-        # Initialize adapters
         catalog_path = config.archive.base_dir / "backparq.db"
         catalog = Catalog(catalog_path)
-
-        pool = ConnectionPool(config.database, minconn=2, maxconn=config.archive.concurrency + 2)
         s3 = s3_client_from_config(config.s3)
 
-        # Process each table
         with create_progress() as progress:
             for table_config in config.archive.tables:
                 table = table_config.name
@@ -519,9 +486,8 @@ def restore_tables(
                 chunks_to_restore = []
 
                 for chunk_data in all_chunks:
-                    chunk_start = dt.datetime.fromisoformat(chunk_data["start_ts"])
-                    if chunk_data["start_ts"].endswith("Z"):
-                        chunk_start = chunk_start.replace(tzinfo=dt.timezone.utc)
+                    # parse_iso_datetime handles both "+00:00" and "Z" (Python < 3.11 safe)
+                    chunk_start = parse_iso_datetime(chunk_data["start_ts"])
 
                     if not (start <= chunk_start < end):
                         continue
@@ -530,12 +496,10 @@ def restore_tables(
                     if state not in (ChunkState.UPLOADED, ChunkState.OFFLOADED):
                         continue
 
-                    from backparq.db.operations import ChunkSpec
-
                     chunk_spec = ChunkSpec(
                         table=table,
-                        start=dt.datetime.fromisoformat(chunk_data["start_ts"]),
-                        end=dt.datetime.fromisoformat(chunk_data["end_ts"]),
+                        start=parse_iso_datetime(chunk_data["start_ts"]),
+                        end=parse_iso_datetime(chunk_data["end_ts"]),
                     )
                     chunks_to_restore.append(chunk_spec)
 
@@ -546,7 +510,6 @@ def restore_tables(
                 result.tables_processed += 1
                 task = progress.add_task(f"[green]Restoring {table}", total=len(chunks_to_restore))
 
-                # Wrapper for thread-safe connection handling
                 def _restore_wrapper(c_spec):
                     with pool.connection() as conn:
                         return restore_chunk(
@@ -558,7 +521,6 @@ def restore_tables(
                             conflict_mode=conflict_mode,
                         )
 
-                # Parallel restore
                 with ThreadPoolExecutor(max_workers=config.archive.chunk_concurrency) as executor:
                     futures = {
                         executor.submit(_restore_wrapper, chunk): chunk
@@ -581,8 +543,7 @@ def restore_tables(
         logger.error(f"Restore failed: {e}")
         result.errors.append(str(e))
     finally:
-        if "pool" in locals():
-            pool.close()
+        pool.close()
 
     result.duration_seconds = time.time() - start_time
 
@@ -600,10 +561,6 @@ def verify_archives(
     """
     Verify archive integrity using catalog and S3.
     """
-    from backparq.models import VerifyResult
-    from backparq.operations.verify_op import verify_chunk
-    from backparq.storage.s3 import create_client as s3_client_from_config
-
     result = VerifyResult()
 
     print_header("BACKPARQ VERIFY")
@@ -614,7 +571,6 @@ def verify_archives(
         catalog = Catalog(catalog_path)
         s3 = s3_client_from_config(config.s3) if config.s3.bucket else None
 
-        # Get chunks
         chunks = catalog.list_chunks(table_name=table_filter)
 
         with create_progress() as progress:

@@ -15,6 +15,7 @@ if TYPE_CHECKING:
     from backparq.db.operations import ChunkSpec
 
 from backparq.adapters.catalog import ChunkState
+from backparq.primitives import chunk_id as make_chunk_id
 from backparq.primitives import s3_key_for_chunk
 
 logger = logging.getLogger(__name__)
@@ -49,7 +50,7 @@ def upload_chunk(
     """
     from backparq.storage.s3 import upload_file, verify_checksum
 
-    chunk_id = f"{chunk.table}_{chunk.start.strftime('%Y%m%d%H%M%S')}"
+    chunk_id = make_chunk_id(chunk)
 
     # Check current state
     current_state = catalog.get_state(chunk_id)

@@ -3,7 +3,9 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import signal
 import sys
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -16,10 +18,12 @@ from backparq.db import test_pg_connection
 from backparq.pipeline import restore_tables, verify_archives
 from backparq.plan import plan_archive
 from backparq.prune import prune_backups
+from backparq.query import run_query
 from backparq.status import show_status
 from backparq.storage.parquet import build_encryption
 from backparq.storage.s3 import verify_connection as verify_s3_connection
 from backparq.utils.console import console, print_error, print_info, print_success, print_warning
+from backparq.utils.logging import setup_logging
 
 logger = logging.getLogger(__name__)
 
@@ -27,9 +31,6 @@ EXIT_SUCCESS = 0
 EXIT_CONFIG_ERROR = 1
 EXIT_RUNTIME_ERROR = 2
 EXIT_INTERRUPTED = 130
-
-
-from backparq.utils.logging import setup_logging
 
 
 def _load_config(path_str: str) -> BackparqConfig:
@@ -53,10 +54,6 @@ def handle_test(args: argparse.Namespace) -> None:
     config = _load_config(args.config)
     run_tests(config)
     print_success("All connections validated")
-
-
-import signal
-import threading
 
 
 def handle_archive(args: argparse.Namespace) -> None:
@@ -89,10 +86,10 @@ def handle_archive(args: argparse.Namespace) -> None:
 
 
 def handle_apply(args: argparse.Namespace) -> None:
-    """Legacy command - just runs archive."""
-    config = _load_config(args.config)
-    run_tests(config)
-    archive_tables(config)
+    """Deprecated alias for archive."""
+    args.stats = False
+    args.output = "text"
+    handle_archive(args)
 
 
 def handle_restore(args: argparse.Namespace) -> None:
@@ -131,60 +128,10 @@ def handle_history(args: argparse.Namespace) -> None:
 
 
 def handle_resume(args: argparse.Namespace) -> None:
-    config = _load_config(args.config)
-    run_tests(config)
-
-    # If run_id not provided, find last failed
-    if not args.run_id:
-        # We need to fetch history without showing it, but show_history shows it.
-        # Let's use catalog directly.
-        from backparq.adapters.catalog import Catalog
-        from backparq.status import show_history
-
-        db_path = config.archive.base_dir / "backparq.db"
-        if not db_path.exists():
-            print_error("No catalog found to resume from.")
-            sys.exit(1)
-
-        with Catalog(db_path) as catalog:
-            history = catalog.get_history(limit=10)
-            for run in history:
-                if run["status"] == "failed":
-                    args.run_id = run["id"]
-                    print_info(f"Resuming last failed run: {args.run_id}")
-                    break
-
-        if not args.run_id:
-            print_warning("No recent failed runs found to resume.")
-            # We proceed anyway? Or exit?
-            # User might just want to run archive.
-            # But command is "resume".
-            if not Prompt.ask("Start a new run?", choices=["y", "n"], default="y") == "y":
-                sys.exit(0)
-
-    # Re-use handle_archive logic
-    # But handle_archive takes args and parses config again.
-    # We can just call archive_tables directly.
-
-    shutdown_event = threading.Event()
-
-    def signal_handler(sig: int, frame: Any) -> None:
-        logger.warning(f"Received signal {sig}, initiating graceful shutdown...")
-        shutdown_event.set()
-
-    original_sigint = signal.getsignal(signal.SIGINT)
-    original_sigterm = signal.getsignal(signal.SIGTERM)
-    signal.signal(signal.SIGINT, signal_handler)
-    signal.signal(signal.SIGTERM, signal_handler)
-
-    try:
-        # We pass the CURRENT config. Idempotency handles the "resume" part.
-        result = archive_tables(config, show_stats=args.stats, shutdown_event=shutdown_event)
-        if not result.success:
-            sys.exit(EXIT_RUNTIME_ERROR)
-    finally:
-        signal.signal(signal.SIGINT, original_sigint)
-        signal.signal(signal.SIGTERM, original_sigterm)
+    """Re-run archive — idempotency skips already-completed chunks."""
+    args.stats = getattr(args, "stats", False)
+    args.output = "text"
+    handle_archive(args)
 
 
 def handle_verify(args: argparse.Namespace) -> None:
@@ -226,9 +173,6 @@ def handle_validate(args: argparse.Namespace) -> None:
     except Exception as e:
         print_error(f"Validation failed: {e}")
         sys.exit(EXIT_CONFIG_ERROR)
-
-
-from backparq.query import run_query
 
 
 def handle_query(args: argparse.Namespace) -> None:

@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 import datetime as dt
-import json
 import logging
 import sqlite3
+import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
 from enum import Enum
@@ -87,12 +87,13 @@ class Catalog:
         """
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._conn: Optional[sqlite3.Connection] = None
         self._init_schema()
 
     def _init_schema(self) -> None:
         """Initialize database schema if needed."""
         with self._connection() as conn:
+            # Enable WAL mode for concurrent readers/writers without blocking.
+            conn.execute("PRAGMA journal_mode=WAL")
             conn.executescript(SCHEMA_SQL)
 
             # Check/set schema version
@@ -185,12 +186,10 @@ class Catalog:
         now = dt.datetime.now(dt.timezone.utc).isoformat()
 
         with self._connection() as conn:
-            # Check if chunk exists
             cursor = conn.execute("SELECT state FROM chunks WHERE id = ?", (chunk_id,))
             row = cursor.fetchone()
 
             if row is None:
-                # Create new chunk record
                 # Create new chunk record
                 conn.execute(
                     """
@@ -237,8 +236,8 @@ class Catalog:
                         values.append(metadata[key])
 
                 values.append(chunk_id)
-                sql = f"UPDATE chunks SET {', '.join(update_fields)} WHERE id = ?"
-                conn.execute(sql, values)
+                stmt = f"UPDATE chunks SET {', '.join(update_fields)} WHERE id = ?"
+                conn.execute(stmt, values)
                 logger.debug(f"Transitioned chunk {chunk_id} to {new_state.value}")
 
     def list_chunks(
@@ -250,27 +249,27 @@ class Catalog:
         List chunks matching criteria.
 
         Args:
-            table_name: Filter by table name
+            table_name: Filter by table name (exact match)
             state: Filter by state
 
         Returns:
             List of chunk records
         """
         with self._connection() as conn:
-            sql = "SELECT * FROM chunks WHERE 1=1"
+            query = "SELECT * FROM chunks WHERE 1=1"
             params: list[Any] = []
 
             if table_name:
-                sql += " AND table_name = ?"
+                query += " AND table_name = ?"
                 params.append(table_name)
 
             if state:
-                sql += " AND state = ?"
+                query += " AND state = ?"
                 params.append(state.value)
 
-            sql += " ORDER BY table_name, start_ts"
+            query += " ORDER BY table_name, start_ts"
 
-            cursor = conn.execute(sql, params)
+            cursor = conn.execute(query, params)
             return [dict(row) for row in cursor.fetchall()]
 
     def start_run(self, mode: str, config_hash: Optional[str] = None) -> str:
@@ -282,9 +281,13 @@ class Catalog:
             config_hash: Optional SHA256 of config used
 
         Returns:
-            Run ID
+            Run ID (timestamp + UUID suffix — guaranteed unique)
         """
-        run_id = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%d_%H%M%S")
+        run_id = (
+            dt.datetime.now(dt.timezone.utc).strftime("%Y%m%d_%H%M%S")
+            + "_"
+            + uuid.uuid4().hex[:6]
+        )
         now = dt.datetime.now(dt.timezone.utc).isoformat()
 
         with self._connection() as conn:
@@ -342,15 +345,12 @@ class Catalog:
             Dict with counts by state, total chunks, etc.
         """
         with self._connection() as conn:
-            # Count by state
             cursor = conn.execute("SELECT state, COUNT(*) as count FROM chunks GROUP BY state")
             by_state = {row["state"]: row["count"] for row in cursor.fetchall()}
 
-            # Total chunks
             cursor = conn.execute("SELECT COUNT(*) as total FROM chunks")
             total = cursor.fetchone()["total"]
 
-            # Total runs
             cursor = conn.execute("SELECT COUNT(*) as total FROM runs")
             total_runs = cursor.fetchone()["total"]
 
