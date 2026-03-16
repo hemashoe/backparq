@@ -93,3 +93,6 @@ config.local.yaml
 *.pem
 *.key
 secrets/
+
+# Claude Code worktrees
+.claude/
