@@ -7,7 +7,6 @@ from contextlib import contextmanager
 from typing import Any, Optional
 
 import psycopg
-from psycopg import sql
 from psycopg_pool import ConnectionPool as PsycopgPool
 from tenacity import retry, stop_after_attempt, wait_exponential
 
@@ -64,35 +63,14 @@ class ConnectionPool:
         return self._pool
 
     @contextmanager
-    def connection(self, snapshot_id: Optional[str] = None) -> Iterator[psycopg.Connection]:
-        """
-        Get a connection from the pool.
-
-        Args:
-            snapshot_id: Optional PostgreSQL snapshot ID to synchronize transaction view.
-                         Requires Repeatable Read isolation.
-        """
+    def connection(self) -> Iterator[psycopg.Connection]:
+        """Get a READ COMMITTED connection from the pool."""
         pool = self._ensure_pool()
         with pool.connection() as conn:
             try:
-                if snapshot_id:
-                    # Snapshot sharing allows workers to see the exact same DB state
-                    conn.isolation_level = psycopg.IsolationLevel.REPEATABLE_READ
-
-                    # Explicitly start the transaction with the snapshot
-                    # We use a transaction block to ensure commit/rollback
-                    with conn.transaction():
-                        query = sql.SQL("SET TRANSACTION SNAPSHOT {}").format(
-                            sql.Literal(snapshot_id)
-                        )
-                        conn.execute(query)
-                        yield conn
-                else:
-                    # Standard Read Committed transaction
-                    conn.isolation_level = psycopg.IsolationLevel.READ_COMMITTED
-                    # We simulate the same behavior: yield conn, then commit
-                    yield conn
-                    conn.commit()
+                conn.isolation_level = psycopg.IsolationLevel.READ_COMMITTED
+                yield conn
+                conn.commit()
             except Exception:
                 conn.rollback()
                 raise

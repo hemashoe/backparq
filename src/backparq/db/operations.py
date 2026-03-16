@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import datetime as dt
 import logging
+import re
 import time
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
@@ -93,6 +95,8 @@ def pg_get_min_created_at(
         cur.execute(query)
         row = cur.fetchone()
         val = row[0] if row else None
+        if val is None:
+            return None
         return normalize_dt(val)
 
 
@@ -215,8 +219,6 @@ def list_chunks(
     return chunks
 
 
-import re
-
 _SAFE_IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
@@ -337,10 +339,14 @@ def export_chunk_to_parquet_streaming(
         con.execute("INSTALL postgres;")
         con.execute("LOAD postgres;")
 
-        # Execute copy and fetch result
         con.execute(query)
-        res = con.fetchall()
-        exported = res[0][0] if res else 0
+
+        # COPY TO does not reliably return a row count across DuckDB versions.
+        # Read the row count from the written file instead.
+        count_row = con.execute(
+            f"SELECT COUNT(*) FROM read_parquet('{parquet_path.as_posix()}')"
+        ).fetchone()
+        exported = count_row[0] if count_row else 0
 
         logger.info(f"Export complete: {exported} rows written to {parquet_path}")
         return exported
@@ -617,7 +623,7 @@ def insert_arrow_table_to_pg(
 
         buf.seek(0)
 
-        stage_table = f"stage_{int(time.time() * 1000000)}"
+        stage_table = f"stage_{uuid.uuid4().hex[:12]}"
         stage_ident = sql.Identifier(stage_table)
 
         with conn.cursor() as cur:

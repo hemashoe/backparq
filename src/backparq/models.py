@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import datetime as dt
 import threading
 from dataclasses import dataclass, field
 
@@ -84,33 +83,3 @@ class VerifyResult:
         }
 
 
-@dataclass
-class TableProgress:
-    status: str = "pending"
-    chunks_total: int = 0
-    chunks_complete: int = 0
-    rows_archived: int = 0
-    bytes_uploaded: int = 0
-
-    def to_dict(self) -> dict:
-        return {
-            "status": self.status,
-            "chunks_total": self.chunks_total,
-            "chunks_complete": self.chunks_complete,
-            "rows_archived": self.rows_archived,
-            "bytes_uploaded": self.bytes_uploaded,
-        }
-
-
-@dataclass
-class RunProgress:
-    run_id: str
-    started_at: dt.datetime
-    tables: dict[str, TableProgress] = field(default_factory=dict)
-
-    def to_dict(self) -> dict:
-        return {
-            "run_id": self.run_id,
-            "started_at": self.started_at.isoformat(),
-            "tables": {k: v.to_dict() for k, v in self.tables.items()},
-        }
